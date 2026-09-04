@@ -18,6 +18,7 @@ import re
 import shutil
 import tempfile
 import time
+import uuid
 from collections import OrderedDict
 from datetime import datetime
 from pathlib import Path
@@ -619,6 +620,156 @@ _EVENT_META_CONTENT_CAP = 500
 _MEDIA_KIND_PRIORITY = (("image", MessageType.PHOTO), ("audio", MessageType.AUDIO), ("video", MessageType.VIDEO))
 _ATTACHMENT_KIND_TYPES = {"image": MessageType.PHOTO, "video": MessageType.VIDEO, "audio": MessageType.AUDIO, "document": MessageType.DOCUMENT}
 
+_LISTEN_MODES = frozenset({"always", "mentions"})
+_REPLY_MODES = frozenset({"flat", "threaded", "hybrid"})
+_CHANNEL_POLICY_KEYS = frozenset({"listen", "replies"})
+_BUZZ_STATUS_FORMS = frozenset({"status", "listen status", "replies status"})
+_BUZZ_COMMAND_USAGE = (
+    "Usage: /buzz status | /buzz listen status|always|mentions|reset | "
+    "/buzz replies status|flat|threaded|hybrid|reset"
+)
+
+
+def _canonical_channel_id(channel_id: Any) -> str:
+    """Return a canonical Buzz channel UUID or raise a bounded config error."""
+    try:
+        return str(uuid.UUID(str(channel_id).strip()))
+    except (AttributeError, TypeError, ValueError) as exc:
+        raise ValueError(
+            f"gateway.platforms.buzz.extra.channel_modes has invalid channel UUID {channel_id!r}"
+        ) from exc
+
+
+def _validate_channel_modes(raw: Any) -> Dict[str, Dict[str, str]]:
+    """Strictly validate and copy the sparse persisted channel-mode mapping."""
+    if raw is None:
+        return {}
+    if not isinstance(raw, dict):
+        raise ValueError(
+            "gateway.platforms.buzz.extra.channel_modes must be a mapping"
+        )
+    normalized: Dict[str, Dict[str, str]] = {}
+    for raw_channel_id, raw_modes in raw.items():
+        channel_id = _canonical_channel_id(raw_channel_id)
+        if channel_id in normalized:
+            raise ValueError(
+                "gateway.platforms.buzz.extra.channel_modes contains duplicate channel UUIDs"
+            )
+        if not isinstance(raw_modes, dict) or not raw_modes:
+            raise ValueError(
+                f"gateway.platforms.buzz.extra.channel_modes.{channel_id} must be a non-empty mapping"
+            )
+        unknown = set(raw_modes) - _CHANNEL_POLICY_KEYS
+        if unknown:
+            raise ValueError(
+                f"gateway.platforms.buzz.extra.channel_modes.{channel_id} has unsupported keys: "
+                + ", ".join(sorted(str(key) for key in unknown))
+            )
+        modes: Dict[str, str] = {}
+        for policy, allowed in (("listen", _LISTEN_MODES), ("replies", _REPLY_MODES)):
+            if policy not in raw_modes:
+                continue
+            value = raw_modes[policy]
+            if not isinstance(value, str) or value.strip().lower() not in allowed:
+                raise ValueError(
+                    f"gateway.platforms.buzz.extra.channel_modes.{channel_id}.{policy} "
+                    f"must be one of {', '.join(sorted(allowed))}"
+                )
+            modes[policy] = value.strip().lower()
+        normalized[channel_id] = modes
+    return normalized
+
+
+def _is_exact_buzz_command(content: str) -> bool:
+    """Recognize only a leading, standalone ``/buzz`` command token."""
+    parts = str(content or "").strip().split(None, 1)
+    return bool(parts and parts[0].lower() == "/buzz")
+
+
+def _buzz_command_access(raw_args: str) -> str:
+    """Only the three exact, read-only status forms are user-accessible."""
+    normalized = " ".join(str(raw_args or "").strip().lower().split())
+    return "user" if normalized in _BUZZ_STATUS_FORMS else "admin"
+
+
+def _parse_buzz_command(raw_args: str) -> Optional[Tuple[str, Optional[str]]]:
+    normalized = " ".join(str(raw_args or "").strip().lower().split())
+    if normalized == "status":
+        return "status", None
+    parts = normalized.split()
+    if len(parts) != 2 or parts[0] not in _CHANNEL_POLICY_KEYS:
+        return None
+    policy, action = parts
+    if action == "status":
+        return policy, None
+    allowed = _LISTEN_MODES if policy == "listen" else _REPLY_MODES
+    if action in allowed or action == "reset":
+        return policy, action
+    return None
+
+
+def _format_buzz_status(status: dict, selected: str = "status") -> str:
+    if not status.get("applicable", True):
+        reply_mode = (status.get("replies") or {}).get("effective", "threaded")
+        return (
+            "Buzz channel policies do not apply to direct messages. "
+            f"DMs always listen; replies use the existing {reply_mode} behavior."
+        )
+    lines = ["Buzz channel policy:"]
+    if selected in {"status", "listen"}:
+        listen = status.get("listen") or {}
+        lines.append(
+            f"Listening: {listen.get('effective', 'unknown')} "
+            f"({listen.get('source', 'unknown')})"
+        )
+    if selected in {"status", "replies"}:
+        replies = status.get("replies") or {}
+        lines.append(
+            f"Replies: {replies.get('effective', 'unknown')} "
+            f"({replies.get('source', 'unknown')})"
+        )
+    return "\n".join(lines)
+
+
+def _format_buzz_action_error(result: dict) -> str:
+    detail = str(result.get("detail") or result.get("error") or "unknown error")
+    return f"Could not update Buzz channel policy: {detail}"
+
+
+async def _handle_buzz_command(raw_args: str, invocation) -> str:
+    """Handle the fixed `/buzz` control grammar through source-bound actions."""
+    parsed = _parse_buzz_command(raw_args)
+    if parsed is None:
+        return _BUZZ_COMMAND_USAGE
+    selected, action = parsed
+    if invocation is None:
+        return f"/buzz channel controls are available from the Buzz gateway.\n{_BUZZ_COMMAND_USAGE}"
+    if str(getattr(invocation, "platform", "")).strip().lower() != "buzz":
+        return "Buzz channel controls are only available from a Buzz conversation."
+    chat_type = str(getattr(invocation, "chat_type", "") or "").strip().lower()
+    actions = getattr(invocation, "platform_actions", None)
+    if action is not None and chat_type in {"", "dm", "direct", "private"}:
+        return (
+            "Buzz channel policies do not apply to direct messages; "
+            "DM behavior is unchanged and no override was saved."
+        )
+    if action is None:
+        result = await actions.get_channel_policy_status()
+    else:
+        result = await actions.set_channel_policy(selected, action)
+    if not isinstance(result, dict) or result.get("ok") is not True:
+        return _format_buzz_action_error(result if isinstance(result, dict) else {})
+    status = result.get("status")
+    if not isinstance(status, dict):
+        return "Buzz channel policy action succeeded, but status is unavailable."
+    text = _format_buzz_status(status, selected)
+    if action is not None:
+        if result.get("live_applied") is True:
+            text += "\nSaved and active now."
+        elif result.get("persisted") is True:
+            text += "\nSaved, but the live adapter could not be updated; restart required."
+    return text
+
 
 class BuzzAdapter(BasePlatformAdapter):
     """Buzz adapter (WebSocket push with poll fallback) for the BasePlatformAdapter interface."""
@@ -649,6 +800,8 @@ class BuzzAdapter(BasePlatformAdapter):
         _rm_cfg = _setting_or("BUZZ_REQUIRE_MENTION", extra, "require_mention", True)
         self.require_mention = str(_rm_cfg).strip().lower() not in ("false", "0", "no", "off")
         self._reply_to_mode: str = _reply_to_mode(config, extra)
+        # Sparse, profile-scoped controls are fully validated before this adapter accepts events.
+        self._channel_modes = _validate_channel_modes(extra.get("channel_modes"))
         # Inbound transport: "auto" (WebSocket with poll fallback), "websocket" (required), "poll".
         _transport_raw = _scoped_platform_setting("BUZZ_TRANSPORT", extra, "transport")
         _transport = (_transport_raw or str(extra.get("transport", "auto") or "auto")).strip().lower()
@@ -699,6 +852,84 @@ class BuzzAdapter(BasePlatformAdapter):
         the hex pubkey, so a plain string compare would deny listed users.
         """
         return _normalize_user_ref(user_id)
+
+    @staticmethod
+    def normalize_source_identity_candidates(source) -> Tuple[str, ...]:
+        """Return equivalent lowercase hex and npub sender identities."""
+        candidates: List[str] = []
+        for raw in (
+            getattr(source, "user_id", None),
+            getattr(source, "user_id_alt", None),
+        ):
+            normalized = _normalize_user_ref(str(raw or ""))
+            if normalized and normalized not in candidates:
+                candidates.append(normalized)
+            npub = hex_to_npub(normalized) if normalized else None
+            if npub and npub not in candidates:
+                candidates.append(npub)
+        return tuple(candidates)
+
+    @staticmethod
+    def validate_channel_modes(raw: Any) -> Dict[str, Dict[str, str]]:
+        """Validate a complete persisted mapping for the host mutation service."""
+        return _validate_channel_modes(raw)
+
+    def apply_channel_policy(
+        self, channel_id: str, policy: str, value: Optional[str]
+    ) -> Dict[str, Any]:
+        """Apply one already-persisted policy in memory without performing I/O."""
+        channel_id = _canonical_channel_id(channel_id)
+        policy = str(policy or "").strip().lower()
+        if policy not in _CHANNEL_POLICY_KEYS:
+            raise ValueError(f"unsupported Buzz channel policy {policy!r}")
+        if value is not None:
+            value = str(value).strip().lower()
+            allowed = _LISTEN_MODES if policy == "listen" else _REPLY_MODES
+            if value not in allowed:
+                raise ValueError(f"unsupported Buzz {policy} mode {value!r}")
+
+        updated = {cid: dict(modes) for cid, modes in self._channel_modes.items()}
+        modes = updated.get(channel_id, {})
+        if value is None:
+            modes.pop(policy, None)
+        else:
+            modes[policy] = value
+        if modes:
+            updated[channel_id] = modes
+        else:
+            updated.pop(channel_id, None)
+        self._channel_modes = _validate_channel_modes(updated)
+        return self.channel_policy_status(channel_id)
+
+    def channel_policy_status(
+        self, channel_id: str, *, chat_type: str = "group"
+    ) -> Dict[str, Any]:
+        """Return effective modes and whether each is inherited or explicit."""
+        inherited_replies = "flat" if self._reply_to_mode == "off" else "threaded"
+        if str(chat_type or "").strip().lower() in {"", "dm", "direct", "private"}:
+            return {
+                "applicable": False,
+                "listen": {"effective": "always", "source": "direct-message"},
+                "replies": {"effective": inherited_replies, "source": "inherited"},
+            }
+        try:
+            canonical_id = str(uuid.UUID(str(channel_id).strip()))
+        except (AttributeError, TypeError, ValueError):
+            canonical_id = str(channel_id or "")
+        explicit = self._channel_modes.get(canonical_id, {})
+        return {
+            "applicable": True,
+            "listen": {
+                "effective": explicit.get(
+                    "listen", "mentions" if self.require_mention else "always"
+                ),
+                "source": "explicit" if "listen" in explicit else "inherited",
+            },
+            "replies": {
+                "effective": explicit.get("replies", inherited_replies),
+                "source": "explicit" if "replies" in explicit else "inherited",
+            },
+        }
 
     # ── buzz-cli plumbing ─────────────────────────────────────────────────
 
@@ -1619,7 +1850,13 @@ class BuzzAdapter(BasePlatformAdapter):
         reply_to_is_own = bool(reply_meta is not None and reply_meta[0] == self._self_pubkey)
         # Channels dispatch only when addressed (@mention or p-tag) or replying to us (Signal/WhatsApp parity),
         # unless require_mention is off. DMs always dispatch.
-        if not is_dm and self.require_mention and not self._is_addressed(event) and not reply_to_is_own:
+        if (
+            not is_dm
+            and self.require_mention
+            and not self._is_addressed(event)
+            and not reply_to_is_own
+            and not _is_exact_buzz_command(content)
+        ):
             return
         # Adapter-level allow-list (gateway also applies it centrally); empty = no filter.
         if self._allowed_pubkeys and pubkey not in self._allowed_pubkeys:
@@ -2135,4 +2372,14 @@ def register(ctx):
             "by @-mentioning your name or npub in channels; direct messages "
             "reach you without a mention. Keep responses conversational."
         ),
+    )
+    ctx.register_command(
+        "buzz",
+        _handle_buzz_command,
+        description="Inspect or change Buzz channel interaction modes",
+        args_hint="status | listen … | replies …",
+        argument_mode="mixed",
+        with_context=True,
+        access=_buzz_command_access,
+        busy_policy="reject",
     )

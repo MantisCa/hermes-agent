@@ -370,6 +370,7 @@ class TestSourceBoundChannelPolicy:
             routed_profile="default",
             channel_id="channel-1",
             thread_id="thread-1",
+            chat_type="group",
             source_identity_candidates=("ordinary", "admin-alt"),
             policy="listen",
             value="always",
@@ -381,7 +382,6 @@ class TestSourceBoundChannelPolicy:
             (False, "group", "default", ("admin-alt",), "capability_not_granted"),
             (True, "dm", "default", ("admin-alt",), "unsupported_context"),
             (True, "group", "../other", ("admin-alt",), "invalid_argument"),
-            (True, "group", "default", ("ordinary",), "explicit_admin_required"),
         ],
     )
     def test_invalid_or_unauthorized_binding_fails_before_host_side_effect(
@@ -402,6 +402,52 @@ class TestSourceBoundChannelPolicy:
 
         assert result["error"] == error
         runner._apply_plugin_channel_policy_action.assert_not_awaited()
+
+    def test_mutation_authority_is_rechecked_by_routed_profile_service(self):
+        """The facade must not consult the launch profile's runner.config."""
+        runner = self._runner(admin_ids=())
+        bound = PlatformActions("p").for_source(
+            platform="telegram",
+            channel_id="channel-1",
+            thread_id=None,
+            chat_type="group",
+            routed_profile="team-b",
+            source_identity_candidates=("team-b-admin",),
+        )
+
+        with _grant(True), patch("gateway.run._gateway_runner_ref", lambda: runner):
+            result = asyncio.run(bound.set_channel_policy("listen", "always"))
+
+        assert result["ok"] is True
+        runner._apply_plugin_channel_policy_action.assert_awaited_once()
+
+    def test_read_only_status_uses_source_bound_host_service(self):
+        runner = self._runner(admin_ids=())
+        runner._get_plugin_channel_policy_status_action = AsyncMock(
+            return_value={"ok": True, "status": {"applicable": True}}
+        )
+        bound = PlatformActions("p").for_source(
+            platform="telegram",
+            channel_id="channel-1",
+            thread_id=None,
+            chat_type="group",
+            routed_profile="team-b",
+            source_identity_candidates=("ordinary",),
+        )
+
+        with _grant(True), patch("gateway.run._gateway_runner_ref", lambda: runner):
+            result = asyncio.run(bound.get_channel_policy_status())
+
+        assert result == {"ok": True, "status": {"applicable": True}}
+        runner._get_plugin_channel_policy_status_action.assert_awaited_once_with(
+            plugin_id="p",
+            platform="telegram",
+            routed_profile="team-b",
+            channel_id="channel-1",
+            thread_id=None,
+            chat_type="group",
+            source_identity_candidates=("ordinary",),
+        )
 
 
 class TestPluginContextWiring:
