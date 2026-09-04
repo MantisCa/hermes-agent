@@ -2011,6 +2011,42 @@ class TestPluginCommands:
         assert mgr._plugin_commands["lcm"]["argument_mode"] == "text"
         assert mgr._plugin_commands["ping"]["argument_mode"] is None
 
+    def test_context_aware_command_is_opt_in_and_cli_receives_no_gateway_context(self):
+        mgr = PluginManager()
+        manifest = PluginManifest(name="test-plugin", source="user")
+        ctx = PluginContext(manifest, mgr)
+        calls = []
+
+        def legacy(raw_args):
+            calls.append(("legacy", raw_args))
+            return raw_args
+
+        def contextual(raw_args, invocation):
+            calls.append(("contextual", raw_args, invocation))
+            return "unsupported-surface" if invocation is None else "gateway"
+
+        ctx.register_command("legacy", legacy)
+        ctx.register_command(
+            "contextual",
+            contextual,
+            with_context=True,
+            access=lambda raw_args: "user" if raw_args == "status" else "admin",
+            busy_policy="dispatch",
+        )
+
+        with patch("hermes_cli.plugins._ensure_plugins_discovered", return_value=mgr):
+            assert get_plugin_command_handler("legacy")("same args") == "same args"
+            assert get_plugin_command_handler("contextual")("status") == "unsupported-surface"
+
+        assert calls == [
+            ("legacy", "same args"),
+            ("contextual", "status", None),
+        ]
+        assert mgr._plugin_commands["legacy"]["with_context"] is False
+        assert mgr._plugin_commands["legacy"]["access"] is None
+        assert mgr._plugin_commands["legacy"]["busy_policy"] == "reject"
+        assert mgr._plugin_commands["contextual"]["with_context"] is True
+
 
 
 

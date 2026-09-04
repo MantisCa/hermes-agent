@@ -2328,6 +2328,23 @@ class BasePlatformAdapter(ABC):
         :meth:`_session_key_profile` so adapter-level keys leave ``agent:main:``."""
         self._owner_profile = None if (name := (profile_name or "").strip() or None) == "default" else name
 
+    def normalize_source_identity_candidates(self, source: Any) -> tuple[str, ...]:
+        """Return stable sender identities suitable for scoped admin checks.
+
+        Adapters may override this to add equivalent platform encodings. The
+        default preserves both canonical and alternate IDs while exposing no
+        transport client or credential-bearing object.
+        """
+        candidates: list[str] = []
+        for value in (
+            getattr(source, "user_id", None),
+            getattr(source, "user_id_alt", None),
+        ):
+            normalized = str(value or "").strip()
+            if normalized and normalized not in candidates:
+                candidates.append(normalized)
+        return tuple(candidates)
+
     def _session_key_profile(self, source: Optional[Any] = None) -> Optional[str]:
         """Profile namespace for an adapter-derived session key. Ingress runs BEFORE the runner
         stamps ``source.profile``, so without this every bot in a multiplexed gateway shares one

@@ -11,6 +11,7 @@ import logging
 from typing import TYPE_CHECKING
 import asyncio
 import contextlib
+import inspect
 import json
 import os
 import time
@@ -737,6 +738,86 @@ class GatewayBusySessionMixin:
         k: f"_busy_{k}_command" for k in ("start", "stop", "new", "queue", "steer", "egress", "goal", "loop")
     }
 
+    def _plugin_source_identity_candidates(self, source: SessionSource) -> tuple[str, ...]:
+        """Resolve adapter-normalized sender identities without exposing the adapter."""
+        adapter = self._authorization_adapter(source.platform, source.profile)
+        normalize = getattr(adapter, "normalize_source_identity_candidates", None)
+        if callable(normalize):
+            try:
+                values = normalize(source)
+            except Exception:
+                values = ()
+        else:
+            values = (source.user_id, source.user_id_alt)
+        candidates: list[str] = []
+        for value in values or ():
+            normalized = str(value or "").strip()
+            if normalized and normalized not in candidates:
+                candidates.append(normalized)
+        return tuple(candidates)
+
+    def _plugin_routed_profile(self, source: SessionSource) -> str:
+        """Return the routed profile identity, never a profile filesystem path."""
+        name = str(getattr(source, "profile", None) or "").strip()
+        if not name:
+            try:
+                name = str(self._profile_name_for_source(source) or "").strip()
+            except Exception:
+                name = ""
+        if not name:
+            try:
+                name = str(self._active_profile_name() or "").strip()
+            except Exception:
+                name = ""
+        return name or "default"
+
+    async def _dispatch_registered_plugin_command(
+        self, event: MessageEvent, source: SessionSource, command_name: str,
+    ):
+        """Invoke one plugin command using its backward-compatible contract."""
+        from hermes_cli.platform_actions import PlatformActions
+        from hermes_cli.plugins import PluginCommandInvocation, get_plugin_command
+
+        entry = get_plugin_command(command_name)
+        if not entry:
+            return None
+        raw_args = event.get_command_args().strip()
+        handler = entry["handler"]
+        if entry.get("with_context"):
+            platform = source.platform.value if source.platform else ""
+            profile = self._plugin_routed_profile(source)
+            identity_candidates = self._plugin_source_identity_candidates(source)
+            invocation = PluginCommandInvocation(
+                platform=platform,
+                channel_id=str(source.chat_id or ""),
+                thread_id=str(source.thread_id) if source.thread_id is not None else None,
+                message_id=str(event.message_id) if event.message_id is not None else None,
+                chat_type=str(source.chat_type or ""),
+                scope_id=(
+                    str(source.scope_id or source.guild_id)
+                    if (source.scope_id or source.guild_id)
+                    else None
+                ),
+                source_identity_candidates=identity_candidates,
+                routed_profile=profile,
+                platform_actions=PlatformActions(entry["plugin_key"]).for_source(
+                    platform=platform,
+                    channel_id=str(source.chat_id or ""),
+                    thread_id=(
+                        str(source.thread_id) if source.thread_id is not None else None
+                    ),
+                    chat_type=str(source.chat_type or ""),
+                    routed_profile=profile,
+                    source_identity_candidates=identity_candidates,
+                ),
+            )
+            result = handler(raw_args, invocation)
+        else:
+            result = handler(raw_args)
+        if inspect.isawaitable(result):
+            result = await result
+        return str(result) if result else None
+
     async def _dispatch_busy_slash_command(self, event: MessageEvent, cmd_def, quick_key: str, source):
         """Dispatch a recognized slash command while an agent is running.
 
@@ -754,6 +835,14 @@ class GatewayBusySessionMixin:
         name = cmd_def.name
         policy = getattr(cmd_def, "busy_policy", "reject")
         handler_key = getattr(cmd_def, "busy_handler", None)
+        try:
+            from hermes_cli.plugins import get_plugin_command
+
+            plugin_entry = get_plugin_command(name)
+        except Exception:
+            plugin_entry = None
+        if plugin_entry is not None and policy == "dispatch":
+            return await self._dispatch_registered_plugin_command(event, source, name)
         if handler_key:
             special = self._BUSY_SPECIAL_HANDLERS.get(handler_key)
             if special is not None:
@@ -904,14 +993,44 @@ class GatewayBusySessionMixin:
             return await self._handle_loop_command(event)
         return "Agent is running — use /loop status / pause / stop mid-run, or /stop before setting a new loop."
 
-    def _check_slash_access(self, source: SessionSource, canonical_cmd: str) -> Optional[str]:
+    def _check_slash_access(
+        self, source: SessionSource, canonical_cmd: str, raw_args: str = "",
+    ) -> Optional[str]:
         """Denial message if ``source`` cannot run ``canonical_cmd``, else None (both dispatch paths
         use it so an in-flight agent can't bypass admin gating; no ``allow_admin_from`` → None)."""
         from gateway.slash_access import policy_for_source as _policy_for_source
         if not canonical_cmd:
             return None
         policy = _policy_for_source(self.config, source)
-        if not policy.enabled or policy.can_run(source.user_id, canonical_cmd):
+        identity_candidates = self._plugin_source_identity_candidates(source)
+        try:
+            from hermes_cli.plugins import get_plugin_command, plugin_command_access_level
+
+            plugin_entry = get_plugin_command(canonical_cmd)
+            required_access = (
+                plugin_command_access_level(plugin_entry, raw_args)
+                if plugin_entry is not None
+                else None
+            )
+        except Exception:
+            plugin_entry = None
+            from hermes_cli.commands import resolve_command
+
+            required_access = None if resolve_command(canonical_cmd) else "admin"
+        if required_access == "user":
+            return None
+        if required_access == "admin":
+            allowed = policy.is_explicit_admin(identity_candidates)
+        else:
+            allowed = (
+                not policy.enabled
+                or policy.can_run(
+                    source.user_id,
+                    canonical_cmd,
+                    identity_candidates=identity_candidates,
+                )
+            )
+        if allowed:
             return None
         logger.info(
             "Slash command /%s denied for %s:%s (not admin, not in user_allowed_commands)",

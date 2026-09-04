@@ -333,6 +333,34 @@ def resolve_command(name: str) -> CommandDef | None:
     return _COMMAND_LOOKUP.get(name.lower().lstrip("/"))
 
 
+def resolve_gateway_command(name: str) -> CommandDef | None:
+    """Resolve a core or plugin command to the common gateway contract."""
+    core = resolve_command(name)
+    if core is not None:
+        return core
+    try:
+        from hermes_cli.plugins import get_plugin_command
+
+        clean = str(name or "").strip().lstrip("/").lower().replace("_", "-")
+        entry = get_plugin_command(clean)
+    except Exception:
+        entry = None
+    if not entry:
+        return None
+    busy_policy = str(entry.get("busy_policy") or "reject")
+    if busy_policy not in VALID_BUSY_POLICIES:
+        busy_policy = "reject"
+    return CommandDef(
+        clean,
+        str(entry.get("description") or f"Run /{clean}"),
+        "Plugins",
+        args_hint=str(entry.get("args_hint") or ""),
+        gateway_only=True,
+        busy_policy=busy_policy,
+        argument_mode=entry.get("argument_mode"),
+    )
+
+
 def _build_description(cmd: CommandDef) -> str:
     """CLI-facing description including the usage hint."""
     if not cmd.args_hint:
@@ -396,7 +424,7 @@ ACTIVE_SESSION_BYPASS_COMMANDS: frozenset[str] = frozenset(
 
 def is_interrupt_then_dispatch(command_name: str | None) -> bool:
     """Guard 1 (gateway/platforms/base.py) routes these through the cancel-handoff path."""
-    cmd = resolve_command(command_name) if command_name else None
+    cmd = resolve_gateway_command(command_name) if command_name else None
     return cmd is not None and cmd.busy_policy == "interrupt_then_dispatch"
 
 
@@ -411,7 +439,7 @@ def should_bypass_active_session(command_name: str | None) -> bool:
 
     See #10370, #4665, #5057, #6252.
     """
-    return resolve_command(command_name) is not None if command_name else False
+    return resolve_gateway_command(command_name) is not None if command_name else False
 
 
 def _resolve_config_gates() -> set[str]:

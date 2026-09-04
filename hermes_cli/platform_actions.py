@@ -7,7 +7,10 @@ Every verb returns a structured result dict — ``{"ok": True, ...}`` on success
 from __future__ import annotations
 
 import logging
-from typing import Any, Dict
+import inspect
+from dataclasses import dataclass
+from types import SimpleNamespace
+from typing import Any, Dict, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -80,6 +83,33 @@ class PlatformActions:
 
     def __init__(self, plugin_id: str):
         self._plugin_id = plugin_id
+
+    def for_source(
+        self,
+        *,
+        platform: str,
+        channel_id: str,
+        thread_id: Optional[str],
+        chat_type: str,
+        routed_profile: str,
+        source_identity_candidates: Tuple[str, ...],
+    ) -> "SourceBoundPlatformActions":
+        """Bind the mutation-only facade to one immutable gateway source."""
+        return SourceBoundPlatformActions(
+            owner=self,
+            platform=str(platform or ""),
+            channel_id=str(channel_id or ""),
+            thread_id=str(thread_id) if thread_id is not None else None,
+            chat_type=str(chat_type or ""),
+            routed_profile=str(routed_profile or ""),
+            source_identity_candidates=tuple(
+                dict.fromkeys(
+                    str(value).strip()
+                    for value in source_identity_candidates
+                    if str(value).strip()
+                )
+            ),
+        )
 
     # -- shared plumbing ----------------------------------------------------
 
@@ -203,9 +233,127 @@ class PlatformActions:
         )
 
 
+@dataclass(frozen=True)
+class SourceBoundPlatformActions:
+    """Mutation facade bound to one source; no adapter or profile path leaks."""
+
+    owner: PlatformActions
+    platform: str
+    channel_id: str
+    thread_id: Optional[str]
+    chat_type: str
+    routed_profile: str
+    source_identity_candidates: Tuple[str, ...]
+
+    async def set_channel_policy(self, policy: str, value: str) -> Dict[str, Any]:
+        """Request a host-owned channel policy mutation after independent gates."""
+        if not self.owner._capability_granted():
+            result = _err("capability_not_granted", f"plugin {self.owner._plugin_id!r} lacks {CAPABILITY_ID!r}")
+            self.owner._audit("set_channel_policy", self.platform, result)
+            return result
+        required = {
+            "platform": self.platform,
+            "channel_id": self.channel_id,
+            "routed_profile": self.routed_profile,
+            "policy": policy,
+            "value": value,
+        }
+        for name, raw in required.items():
+            if not isinstance(raw, str) or not raw.strip():
+                result = _err("invalid_argument", f"{name} must be a non-empty string")
+                self.owner._audit("set_channel_policy", self.platform, result)
+                return result
+        try:
+            from gateway.config import Platform
+
+            platform_enum = Platform(self.platform.strip().lower())
+        except Exception:
+            result = _err("unknown_platform", f"unknown platform {self.platform!r}")
+            self.owner._audit("set_channel_policy", self.platform, result)
+            return result
+        try:
+            from hermes_cli.profiles import normalize_profile_name, validate_profile_name
+
+            profile = normalize_profile_name(self.routed_profile)
+            validate_profile_name(profile)
+        except Exception:
+            result = _err("invalid_argument", "routed_profile is invalid")
+            self.owner._audit("set_channel_policy", self.platform, result)
+            return result
+        if self.chat_type.strip().lower() in {"", "dm", "direct", "private"}:
+            result = _err("unsupported_context", "channel policies require a group or channel source")
+            self.owner._audit("set_channel_policy", self.platform, result)
+            return result
+        if not self.source_identity_candidates:
+            result = _err("explicit_admin_required", "no normalized sender identity is available")
+            self.owner._audit("set_channel_policy", self.platform, result)
+            return result
+        try:
+            from gateway.run import _gateway_runner_ref
+
+            runner = _gateway_runner_ref()
+        except Exception:
+            runner = None
+        if runner is None:
+            result = _err("gateway_unavailable", "no gateway runner is active in this process")
+            self.owner._audit("set_channel_policy", self.platform, result)
+            return result
+        resolve_adapter = getattr(runner, "_authorization_adapter", None)
+        adapter = resolve_adapter(platform_enum, profile) if callable(resolve_adapter) else None
+        if adapter is None:
+            result = _err("adapter_not_registered", f"no {platform_enum.value} adapter is registered for profile {profile!r}")
+            self.owner._audit("set_channel_policy", self.platform, result)
+            return result
+        try:
+            connected = bool(adapter.is_connected)
+        except Exception:
+            connected = False
+        if not connected:
+            result = _err("adapter_disconnected", f"the {platform_enum.value} adapter is not connected")
+            self.owner._audit("set_channel_policy", self.platform, result)
+            return result
+        try:
+            from gateway.slash_access import policy_for_source
+
+            access_policy = policy_for_source(
+                getattr(runner, "config", None),
+                SimpleNamespace(platform=platform_enum, chat_type=self.chat_type),
+            )
+            is_admin = access_policy.is_explicit_admin(self.source_identity_candidates)
+        except Exception:
+            is_admin = False
+        if not is_admin:
+            result = _err("explicit_admin_required", "an explicitly configured scoped admin is required")
+            self.owner._audit("set_channel_policy", self.platform, result)
+            return result
+        service = getattr(runner, "_apply_plugin_channel_policy_action", None)
+        if not callable(service):
+            result = _err("unsupported_platform_action", "the gateway has no channel policy service")
+            self.owner._audit("set_channel_policy", self.platform, result)
+            return result
+        try:
+            result = service(
+                plugin_id=self.owner._plugin_id,
+                platform=platform_enum.value,
+                routed_profile=profile,
+                channel_id=self.channel_id,
+                thread_id=self.thread_id,
+                source_identity_candidates=self.source_identity_candidates,
+                policy=policy.strip(),
+                value=value.strip(),
+            )
+            if inspect.isawaitable(result):
+                result = await result
+            if not isinstance(result, dict) or not isinstance(result.get("ok"), bool):
+                result = _err("action_failed", "channel policy service returned an invalid result")
+        except Exception as exc:
+            result = _err("action_failed", str(exc)[:512])
+        self.owner._audit("set_channel_policy", self.platform, result)
+        return result
+
+
 # ---- BEGIN PLUGIN-COMPAT (revert-scheduled; see COMPAT_MANIFEST.md) ----
 # Names external plugins imported from this module before the Sep 2026 decomposition.
 # Internal code MUST NOT use these (scripts/check_compat_pointers.py fails CI if it does).
 # The whole block is removed by reverting the commit that added it.
-from typing import Optional  # noqa: F401,E402
 # ---- END PLUGIN-COMPAT ----
