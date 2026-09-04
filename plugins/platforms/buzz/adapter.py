@@ -680,6 +680,24 @@ def _validate_channel_modes(raw: Any) -> Dict[str, Dict[str, str]]:
     return normalized
 
 
+def _resolve_effective_listen_mode(
+    channel_modes: Dict[str, Dict[str, str]],
+    channel_id: Any,
+    *,
+    require_mention: bool,
+    chat_type: str = "group",
+) -> str:
+    """Resolve one channel's listen policy without mutating adapter state."""
+    if str(chat_type or "").strip().lower() in {"", "dm", "direct", "private"}:
+        return "always"
+    try:
+        canonical_id = str(uuid.UUID(str(channel_id).strip()))
+    except (AttributeError, TypeError, ValueError):
+        canonical_id = str(channel_id or "")
+    explicit = channel_modes.get(canonical_id, {})
+    return explicit.get("listen", "mentions" if require_mention else "always")
+
+
 def _is_exact_buzz_command(content: str) -> bool:
     """Recognize only a leading, standalone ``/buzz`` command token."""
     parts = str(content or "").strip().split(None, 1)
@@ -920,8 +938,9 @@ class BuzzAdapter(BasePlatformAdapter):
         return {
             "applicable": True,
             "listen": {
-                "effective": explicit.get(
-                    "listen", "mentions" if self.require_mention else "always"
+                "effective": self.effective_listen_mode(
+                    canonical_id,
+                    chat_type=chat_type,
                 ),
                 "source": "explicit" if "listen" in explicit else "inherited",
             },
@@ -930,6 +949,17 @@ class BuzzAdapter(BasePlatformAdapter):
                 "source": "explicit" if "replies" in explicit else "inherited",
             },
         }
+
+    def effective_listen_mode(
+        self, channel_id: str, *, chat_type: str = "group"
+    ) -> str:
+        """Return the effective channel activation mode."""
+        return _resolve_effective_listen_mode(
+            self._channel_modes,
+            channel_id,
+            require_mention=self.require_mention,
+            chat_type=chat_type,
+        )
 
     # ── buzz-cli plumbing ─────────────────────────────────────────────────
 
@@ -1848,15 +1878,19 @@ class BuzzAdapter(BasePlatformAdapter):
         reply_parent_id = _event_reply_parent_id(event)
         reply_meta = self._lookup_event_meta(state, reply_parent_id) if reply_parent_id else None
         reply_to_is_own = bool(reply_meta is not None and reply_meta[0] == self._self_pubkey)
-        # Channels dispatch only when addressed (@mention or p-tag) or replying to us (Signal/WhatsApp parity),
-        # unless require_mention is off. DMs always dispatch.
-        if (
-            not is_dm
-            and self.require_mention
-            and not self._is_addressed(event)
-            and not reply_to_is_own
-            and not _is_exact_buzz_command(content)
-        ):
+        is_addressed = bool(
+            is_dm
+            or self._is_addressed(event)
+            or reply_to_is_own
+            or _is_exact_buzz_command(content)
+        )
+        listen_mode = self.effective_listen_mode(
+            channel_id,
+            chat_type="dm" if is_dm else "group",
+        )
+        # Channels dispatch when addressed (@mention, p-tag, reply to us, or /buzz); ``always``
+        # additionally admits authorized ambient messages. DMs always dispatch.
+        if not is_dm and listen_mode == "mentions" and not is_addressed:
             return
         # Adapter-level allow-list (gateway also applies it centrally); empty = no filter.
         if self._allowed_pubkeys and pubkey not in self._allowed_pubkeys:
@@ -1864,16 +1898,41 @@ class BuzzAdapter(BasePlatformAdapter):
                 await self.send_reaction(channel_id, event_id, "👀")
             logger.debug("Buzz: ignoring message from unauthorized pubkey %s…", pubkey[:8])
             return
-        # Strip a leading @mention (DMs often open with one too) so "@Chip /whoami" is recognized as a command.
+        # Ambient mode widens activation, never sender authority. Only the
+        # gateway's literal True can admit an unaddressed shared-channel event;
+        # missing, false, truthy non-boolean, and failed callbacks all stop
+        # before username lookup, attachments, pairing/dispatch, or reactions.
+        ambient_authorized = False
+        if not is_dm and not is_addressed:
+            ambient_authorized = (
+                self._is_sender_authorized(pubkey, "group", channel_id) is True
+            )
+            if not ambient_authorized:
+                return
+
+        # Strip a leading @mention so slash commands (@Chip /whoami ->
+        # /whoami) and clean prompts are recognized. DM messages often still
+        # open with "@Chip" even though no mention is required there, so the
+        # strip applies to both chat types.
         dispatch_text = self._strip_mention(content)
         # NIP-10 root scopes the session; remember it so our reply joins the SAME thread instead of nesting.
         thread_id = self._extract_thread_root(event)
         self._record_thread_root(event_id, event)
-        # Attachment fetch spends credentials: only the gateway's explicit ``True`` permits it (else fail closed).
-        # The message still dispatches so GatewayRunner can apply denial/pairing.
+        # Attachment fetch/cache is a security-sensitive side effect. Only the
+        # gateway's authoritative callback can permit it, and only an explicit
+        # True is permission: false, absent, or failed checks all fail closed.
+        # An addressed message still dispatches without media so GatewayRunner
+        # can apply denial/pairing; ambient messages were admitted above.
         chat_type = "dm" if is_dm else "group"
-        fetch_allowed = bool(attachment_metadata) and self._is_sender_authorized(pubkey, chat_type, channel_id) is True
-        attachments = await self._cache_inbound_attachments(attachment_metadata) if fetch_allowed else []
+        fetch_allowed = bool(attachment_metadata) and (
+            ambient_authorized
+            or self._is_sender_authorized(pubkey, chat_type, channel_id) is True
+        )
+        attachments = (
+            await self._cache_inbound_attachments(attachment_metadata)
+            if fetch_allowed
+            else []
+        )
         if rejected_attachments:
             dispatch_text = f"{dispatch_text}\n{self._attachment_rejection_note(rejected_attachments)}".strip()
         if fetch_allowed and (failed := len(attachment_metadata) - len(attachments)):
