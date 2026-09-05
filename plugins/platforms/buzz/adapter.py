@@ -623,7 +623,6 @@ _ATTACHMENT_KIND_TYPES = {"image": MessageType.PHOTO, "video": MessageType.VIDEO
 _LISTEN_MODES = frozenset({"always", "mentions"})
 _REPLY_MODES = frozenset({"flat", "threaded", "hybrid"})
 _CHANNEL_POLICY_KEYS = frozenset({"listen", "replies"})
-_BUZZ_STATUS_FORMS = frozenset({"status", "listen status", "replies status"})
 _BUZZ_COMMAND_USAGE = (
     "Usage: /buzz status | /buzz listen status|always|mentions|reset | "
     "/buzz replies status|flat|threaded|hybrid|reset"
@@ -728,8 +727,8 @@ def _is_exact_buzz_command(content: str) -> bool:
 
 def _buzz_command_access(raw_args: str) -> str:
     """Only the three exact, read-only status forms are user-accessible."""
-    normalized = " ".join(str(raw_args or "").strip().lower().split())
-    return "user" if normalized in _BUZZ_STATUS_FORMS else "admin"
+    parsed = _parse_buzz_command(raw_args)
+    return "user" if parsed is not None and parsed[1] is None else "admin"
 
 
 def _parse_buzz_command(raw_args: str) -> Optional[Tuple[str, Optional[str]]]:
@@ -793,6 +792,8 @@ async def _handle_buzz_command(raw_args: str, invocation) -> str:
             "Buzz channel policies do not apply to direct messages; "
             "DM behavior is unchanged and no override was saved."
         )
+    if actions is None:
+        return "Buzz channel controls are unavailable in this command context."
     if action is None:
         result = await actions.get_channel_policy_status()
     else:
@@ -893,8 +894,7 @@ class BuzzAdapter(BasePlatformAdapter):
         """
         return _normalize_user_ref(user_id)
 
-    @staticmethod
-    def normalize_source_identity_candidates(source) -> Tuple[str, ...]:
+    def normalize_source_identity_candidates(self, source: Any) -> Tuple[str, ...]:
         """Return equivalent lowercase hex and npub sender identities."""
         candidates: List[str] = []
         for raw in (

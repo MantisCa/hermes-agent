@@ -508,6 +508,45 @@ async def test_live_setter_failure_reports_persisted_restart_required(tmp_path, 
 
 
 @pytest.mark.asyncio
+async def test_reasserting_canonical_policy_skips_write_but_repairs_live_state(
+    tmp_path, monkeypatch
+):
+    home = tmp_path / "default"
+    home.mkdir()
+    raw = _raw_profile_config()
+    raw["gateway"]["platforms"]["buzz"]["extra"]["channel_modes"] = {
+        CHANNEL: {"listen": "always"}
+    }
+    config_path = home / "config.yaml"
+    config_path.write_text(yaml.safe_dump(raw))
+    before = config_path.read_bytes()
+    adapter = _adapter()
+    adapter._running = True
+    runner = _runner_for_profiles(adapter)
+    monkeypatch.setattr("hermes_cli.profiles.get_profile_dir", lambda _name: home)
+    write = MagicMock()
+    monkeypatch.setattr("hermes_cli.config.atomic_config_write", write)
+
+    result = await runner._apply_plugin_channel_policy_action(
+        plugin_id="buzz-platform",
+        platform="buzz",
+        routed_profile="default",
+        channel_id=CHANNEL,
+        thread_id=None,
+        chat_type="group",
+        source_identity_candidates=(ADMIN_HEX, ADMIN_NPUB),
+        policy="listen",
+        value="always",
+    )
+
+    assert result["ok"] is True
+    assert result["live_applied"] is True
+    write.assert_not_called()
+    assert config_path.read_bytes() == before
+    assert adapter._channel_modes == {CHANNEL: {"listen": "always"}}
+
+
+@pytest.mark.asyncio
 async def test_routed_capability_recheck_reports_capability_error(tmp_path, monkeypatch):
     home = tmp_path / "default"
     home.mkdir()

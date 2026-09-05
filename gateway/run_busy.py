@@ -1020,16 +1020,17 @@ class GatewayBusySessionMixin:
                 else:
                     updated.pop(canonical_channel, None)
                 validated = validator(updated)
-                if validated:
-                    extra["channel_modes"] = validated
-                else:
-                    extra.pop("channel_modes", None)
-
                 current_bytes = config_path.read_bytes() if config_path.exists() else None
                 if current_bytes != before:
                     raise RuntimeError(
                         "config.yaml changed outside the supported mutation lock; retry the command"
                     )
+                if current_raw == current and validated == current:
+                    return canonical_channel, candidate_value
+                if validated:
+                    extra["channel_modes"] = validated
+                else:
+                    extra.pop("channel_modes", None)
                 config_mod.atomic_config_write(config_path, raw, sort_keys=False)
                 return canonical_channel, candidate_value
 
