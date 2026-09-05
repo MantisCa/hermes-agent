@@ -20,6 +20,7 @@ import importlib.util
 import json
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from unittest.mock import AsyncMock
@@ -179,6 +180,7 @@ class TestThreadRootAnchoring:
                                    content="@Chip follow-up")
         await adapter._handle_event(CHANNEL, adapter._channel_state[CHANNEL], event)
         assert dispatched and dispatched[0].source.thread_id == ROOT_EVT
+        assert dispatched[0].source.message_id == "child-evt"
 
     @pytest.mark.asyncio
     async def test_send_image_anchors_to_root_too(self, tmp_path):
@@ -329,7 +331,244 @@ class TestProgressRouting:
         ) is None
 
 
-# ── 4. Display defaults (#95841) ─────────────────────────────────────────
+# ── 4. Per-channel reply placement ──────────────────────────────────
+
+
+def _reply_arg(args):
+    if "--reply-to" not in args:
+        return None
+    return args[args.index("--reply-to") + 1]
+
+
+@pytest.mark.parametrize(
+    ("mode", "placement", "expected"),
+    [
+        ("flat", "top_level", None),
+        ("flat", "in_thread", None),
+        ("threaded", "top_level", "trigger-evt"),
+        ("threaded", "in_thread", ROOT_EVT),
+        ("hybrid", "top_level", None),
+        ("hybrid", "in_thread", ROOT_EVT),
+    ],
+)
+@pytest.mark.asyncio
+async def test_channel_reply_mode_matrix_covers_text_image_and_file(
+    tmp_path, mode, placement, expected
+):
+    """Every reply-capable send path obeys one channel policy resolver."""
+    adapter = _make_adapter(
+        extra={
+            "channel_modes": {CHANNEL: {"replies": mode}},
+            # Explicit per-channel modes must win over inherited global flat.
+            "reply_in_thread": False,
+        }
+    )
+    cli = _CapturingCli()
+    adapter._run_cli = cli
+    attachment = tmp_path / "artifact.png"
+    attachment.write_bytes(b"\x89PNG fake")
+    metadata = {
+        "reply_to_message_id": "trigger-evt",
+        "buzz_trigger_placement": placement,
+    }
+    if placement == "in_thread":
+        metadata["thread_id"] = ROOT_EVT
+
+    await adapter.send(
+        CHANNEL, "text", reply_to="trigger-evt", metadata=metadata
+    )
+    await adapter.send_image(
+        CHANNEL,
+        str(attachment),
+        caption="image",
+        reply_to="trigger-evt",
+        metadata=metadata,
+    )
+    await adapter._send_local_file(
+        CHANNEL,
+        str(attachment),
+        caption="file",
+        reply_to="trigger-evt",
+        metadata=metadata,
+    )
+
+    assert [_reply_arg(args) for args, _ in cli.calls] == [expected] * 3
+
+
+@pytest.mark.parametrize(
+    ("mode", "expected"),
+    [
+        ("threaded", ["top-trigger", ROOT_EVT]),
+        ("hybrid", [None, ROOT_EVT]),
+    ],
+)
+@pytest.mark.asyncio
+async def test_gateway_buzz_metadata_keeps_trigger_and_placement_for_progress(
+    mode, expected
+):
+    """Gateway metadata stays rich even when inherited global replies are flat."""
+    from gateway.config import Platform
+    from gateway.run import GatewayRunner
+
+    runner = object.__new__(GatewayRunner)
+    top_source = SimpleNamespace(
+        platform=Platform.BUZZ,
+        chat_id=CHANNEL,
+        chat_type="group",
+        thread_id=None,
+        message_id="top-trigger",
+        profile=None,
+    )
+    thread_source = SimpleNamespace(
+        platform=Platform.BUZZ,
+        chat_id=CHANNEL,
+        chat_type="group",
+        thread_id=ROOT_EVT,
+        message_id="thread-trigger",
+        profile=None,
+    )
+
+    top_meta = runner._thread_metadata_for_source(top_source)
+    thread_meta = runner._thread_metadata_for_source(thread_source)
+    assert top_meta == {
+        "reply_to_message_id": "top-trigger",
+        "buzz_trigger_placement": "top_level",
+    }
+    assert thread_meta == {
+        "thread_id": ROOT_EVT,
+        "reply_to_message_id": "thread-trigger",
+        "buzz_trigger_placement": "in_thread",
+    }
+
+    adapter = _make_adapter(
+        extra={
+            "reply_in_thread": False,
+            "channel_modes": {CHANNEL: {"replies": mode}},
+        }
+    )
+    cli = _CapturingCli()
+    adapter._run_cli = cli
+    await adapter.send(CHANNEL, "top progress", metadata=top_meta)
+    await adapter.send(CHANNEL, "thread progress", metadata=thread_meta)
+    assert [_reply_arg(args) for args, _ in cli.calls] == expected
+
+
+@pytest.mark.asyncio
+async def test_hybrid_unknown_origin_falls_back_flat_but_explicit_thread_is_supported():
+    adapter = _make_adapter(
+        extra={"channel_modes": {CHANNEL: {"replies": "hybrid"}}}
+    )
+    adapter._thread_roots["known-before-eviction"] = ROOT_EVT
+    adapter._thread_roots.clear()
+    cli = _CapturingCli()
+    adapter._run_cli = cli
+
+    await adapter.send(CHANNEL, "unknown", reply_to="known-before-eviction")
+    await adapter.send(
+        CHANNEL,
+        "synthetic thread target",
+        metadata={"thread_id": ROOT_EVT},
+    )
+
+    assert [_reply_arg(args) for args, _ in cli.calls] == [None, ROOT_EVT]
+
+
+@pytest.mark.asyncio
+async def test_channel_override_does_not_change_direct_message_reply_behavior():
+    adapter = _make_adapter(
+        extra={"channel_modes": {CHANNEL: {"replies": "flat"}}}
+    )
+    adapter._channel_state[CHANNEL] = {
+        "chat_type": "dm",
+        "last_ts": 0,
+        "seen": {},
+    }
+    cli = _CapturingCli()
+    adapter._run_cli = cli
+
+    await adapter.send(CHANNEL, "dm reply", reply_to="dm-trigger")
+
+    assert _reply_arg(cli.calls[0][0]) == "dm-trigger"
+
+
+@pytest.mark.asyncio
+async def test_live_reconstructed_channel_isolation_and_reset_inheritance():
+    other_channel = "38a45d99-7904-5bab-9a92-9d4e6e671812"
+    configured = {
+        CHANNEL: {"replies": "hybrid"},
+        other_channel: {"replies": "flat"},
+    }
+    adapter = _make_adapter(
+        extra={"channel_modes": {other_channel: {"replies": "flat"}}}
+    )
+    adapter.apply_channel_policy(CHANNEL, "replies", "hybrid")
+    rebuilt = _make_adapter(extra={"channel_modes": configured})
+    metadata = {
+        "thread_id": ROOT_EVT,
+        "reply_to_message_id": "trigger-evt",
+        "buzz_trigger_placement": "in_thread",
+    }
+
+    for current in (adapter, rebuilt):
+        cli = _CapturingCli()
+        current._run_cli = cli
+        await current.send(CHANNEL, "threaded", metadata=metadata)
+        await current.send(other_channel, "flat", metadata=metadata)
+        assert [_reply_arg(args) for args, _ in cli.calls] == [ROOT_EVT, None]
+
+    adapter.apply_channel_policy(CHANNEL, "replies", None)
+    cli = _CapturingCli()
+    adapter._run_cli = cli
+    await adapter.send(CHANNEL, "inherited threaded", metadata=metadata)
+    assert _reply_arg(cli.calls[0][0]) == ROOT_EVT
+
+
+@pytest.mark.parametrize(
+    ("channel_mode", "global_alias", "expected"),
+    [
+        ("flat", True, None),
+        ("hybrid", False, ROOT_EVT),
+        ("threaded", False, ROOT_EVT),
+        (None, False, None),
+    ],
+)
+@pytest.mark.asyncio
+async def test_standalone_send_reads_persisted_channel_mode_and_global_alias(
+    monkeypatch, tmp_path, channel_mode, global_alias, expected
+):
+    fake_cli = tmp_path / "buzz"
+    fake_cli.write_text("#!/bin/sh\n")
+    fake_cli.chmod(0o755)
+    captured = {}
+
+    async def fake_exec(
+        cli_path, args, *, relay_url, private_key, auth_tag="", input_text=None,
+        timeout=None,
+    ):
+        captured["args"] = args
+        return 0, json.dumps({"accepted": True, "event_id": "evt-cron"}), ""
+
+    monkeypatch.setattr(_buzz_mod, "_exec_buzz", fake_exec)
+    monkeypatch.setenv("BUZZ_PRIVATE_KEY", "nsec1test")
+    modes = {CHANNEL: {"replies": channel_mode}} if channel_mode else {}
+
+    class _PC:
+        reply_to_mode = "first"
+        extra = {
+            "relay_url": "https://test.relay",
+            "cli_path": str(fake_cli),
+            "reply_in_thread": global_alias,
+            "channel_modes": modes,
+        }
+
+    result = await _buzz_mod._standalone_send(
+        _PC(), CHANNEL, "cron msg", thread_id=ROOT_EVT
+    )
+    assert result.get("success") is True
+    assert _reply_arg(captured["args"]) == expected
+
+
+# ── 5. Display defaults (#95841) ──────────────────────────────────────
 
 
 class TestDisplayDefaults:

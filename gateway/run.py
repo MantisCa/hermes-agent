@@ -4000,6 +4000,22 @@ class GatewayRunner(
             getattr(source, "platform", None), getattr(source, "chat_id", None),
             getattr(source, "thread_id", None), chat_type=getattr(source, "chat_type", None),
             reply_to_message_id=reply_to_message_id or getattr(source, "message_id", None))
+        source_platform = getattr(source, "platform", None)
+        platform_value = getattr(source_platform, "value", source_platform)
+        chat_type = str(getattr(source, "chat_type", None) or "").strip().lower()
+        buzz_trigger_id = reply_to_message_id or getattr(source, "message_id", None)
+        if (
+            str(platform_value or "").strip().lower() == "buzz"
+            and chat_type not in {"", "dm", "direct", "private"}
+            and buzz_trigger_id
+        ):
+            # Preserve trigger provenance and whether it arrived at top level or in a thread; the
+            # Buzz adapter uses the effective per-channel policy to choose final placement.
+            metadata = dict(metadata or {})
+            metadata["reply_to_message_id"] = str(buzz_trigger_id)
+            metadata["buzz_trigger_placement"] = (
+                "in_thread" if getattr(source, "thread_id", None) else "top_level"
+            )
         if getattr(source, "platform", None) == Platform.SLACK:
             # Per-turn egress identity: Slack chat.startStream needs recipient_user_id/team_id; the relay
             # adapter's _with_scope fallback reads per-chat caches a CONCURRENT turn overwrites.

@@ -2746,7 +2746,17 @@ class GatewayTurnMixin:
 
         The connector will auto-thread on the reply anchor (thread is born on its FIRST send), so
         carrying it routes progress / status bubbles into the same thread as the final reply."""
-        if not _progress_thread_id:
+        platform_value = getattr(source.platform, "value", source.platform)
+        is_buzz_channel = (
+            str(platform_value or "").strip().lower() == "buzz"
+            and str(getattr(source, "chat_type", None) or "").strip().lower()
+            not in {"", "dm", "direct", "private"}
+        )
+        if is_buzz_channel and event_message_id:
+            # The Buzz adapter owns flat/threaded/hybrid resolution and needs the triggering event
+            # plus its original placement even when there is no native thread id.
+            metadata = self._thread_metadata_for_source(source, event_message_id)
+        elif not _progress_thread_id:
             metadata = None
         elif _progress_thread_id == source.thread_id:
             metadata = self._thread_metadata_for_source(source, event_message_id)
@@ -2767,21 +2777,22 @@ class GatewayTurnMixin:
         Returns ``(progress_metadata, progress_reply_to, status_thread_metadata)``; the latter is
         for status / approval / stream sends (Feishu topics need the triggering message id via the
         reply API, so carry it as a fallback). Slack and Buzz honour the user's reply_in_thread
-        opt-out: never synthesise a thread for progress, or every later reply inherits it."""
+        opt-out for Slack. Buzz routing is resolved by its effective per-channel policy."""
         from gateway.run import _non_conversational_metadata, _resolve_progress_thread_id
-        is_buzz = str(getattr(source.platform, "value", source.platform) or "").lower() == "buzz"
+        is_buzz = (
+            str(getattr(source.platform, "value", source.platform) or "").lower() == "buzz"
+            and str(getattr(source, "chat_type", None) or "").strip().lower()
+            not in {"", "dm", "direct", "private"}
+        )
         _progress_reply_in_thread = True
-        _adapter = self._adapter_for_source(source) if source.platform == Platform.SLACK or is_buzz else None
+        _adapter = self._adapter_for_source(source) if source.platform == Platform.SLACK else None
         if _adapter is not None:
             try:
-                if is_buzz:
-                    _progress_reply_in_thread = getattr(_adapter, "_reply_to_mode", "first") != "off"
-                else:
-                    # Relay lane: the adapter owns mode resolution; native lane: flat extra key.
-                    _mode_fn = getattr(_adapter, "_effective_reply_in_thread", None)
-                    _progress_reply_in_thread = bool(
-                        _mode_fn() if callable(_mode_fn) else _adapter.config.extra.get("reply_in_thread", True)
-                    )
+                # Relay lane: the adapter owns mode resolution; native lane: flat extra key.
+                _mode_fn = getattr(_adapter, "_effective_reply_in_thread", None)
+                _progress_reply_in_thread = bool(
+                    _mode_fn() if callable(_mode_fn) else _adapter.config.extra.get("reply_in_thread", True)
+                )
             except Exception:
                 _progress_reply_in_thread = True
         _progress_thread_id = _resolve_progress_thread_id(
@@ -2814,11 +2825,11 @@ class GatewayTurnMixin:
                 _progress_metadata.setdefault("slack_team_id", source.scope_id)
             if source.user_id:
                 _progress_metadata.setdefault("recipient_user_id", source.user_id)
-        # Buzz has no native thread_id: thread via reply-to unless the user opted out.
+        # Buzz always carries the trigger; its adapter applies the effective flat/threaded/hybrid mode.
         _progress_reply_to = (
             event_message_id
             if (source.platform in (Platform.FEISHU, Platform.MATTERMOST) and source.thread_id and event_message_id)
-            or (is_buzz and event_message_id and _progress_reply_in_thread)
+            or (is_buzz and event_message_id)
             or _relay_prospective_thread_id
             else None
         )

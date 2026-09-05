@@ -698,6 +698,28 @@ def _resolve_effective_listen_mode(
     return explicit.get("listen", "mentions" if require_mention else "always")
 
 
+def _resolve_effective_reply_mode(
+    channel_modes: Dict[str, Dict[str, str]],
+    channel_id: Any,
+    *,
+    reply_to_mode: str,
+    chat_type: str = "group",
+) -> str:
+    """Resolve one channel's reply placement without mutating adapter state."""
+    inherited = (
+        "flat"
+        if str(reply_to_mode or "").strip().lower() == "off"
+        else "threaded"
+    )
+    if str(chat_type or "").strip().lower() in {"", "dm", "direct", "private"}:
+        return inherited
+    try:
+        canonical_id = str(uuid.UUID(str(channel_id).strip()))
+    except (AttributeError, TypeError, ValueError):
+        canonical_id = str(channel_id or "")
+    return channel_modes.get(canonical_id, {}).get("replies", inherited)
+
+
 def _is_exact_buzz_command(content: str) -> bool:
     """Recognize only a leading, standalone ``/buzz`` command token."""
     parts = str(content or "").strip().split(None, 1)
@@ -923,12 +945,16 @@ class BuzzAdapter(BasePlatformAdapter):
         self, channel_id: str, *, chat_type: str = "group"
     ) -> Dict[str, Any]:
         """Return effective modes and whether each is inherited or explicit."""
-        inherited_replies = "flat" if self._reply_to_mode == "off" else "threaded"
         if str(chat_type or "").strip().lower() in {"", "dm", "direct", "private"}:
             return {
                 "applicable": False,
                 "listen": {"effective": "always", "source": "direct-message"},
-                "replies": {"effective": inherited_replies, "source": "inherited"},
+                "replies": {
+                    "effective": self.effective_reply_mode(
+                        channel_id, chat_type=chat_type
+                    ),
+                    "source": "inherited",
+                },
             }
         try:
             canonical_id = str(uuid.UUID(str(channel_id).strip()))
@@ -945,7 +971,9 @@ class BuzzAdapter(BasePlatformAdapter):
                 "source": "explicit" if "listen" in explicit else "inherited",
             },
             "replies": {
-                "effective": explicit.get("replies", inherited_replies),
+                "effective": self.effective_reply_mode(
+                    canonical_id, chat_type=chat_type
+                ),
                 "source": "explicit" if "replies" in explicit else "inherited",
             },
         }
@@ -958,6 +986,20 @@ class BuzzAdapter(BasePlatformAdapter):
             self._channel_modes,
             channel_id,
             require_mention=self.require_mention,
+            chat_type=chat_type,
+        )
+
+    def effective_reply_mode(
+        self, channel_id: str, *, chat_type: Optional[str] = None
+    ) -> str:
+        """Return the effective outbound placement mode for one conversation."""
+        if chat_type is None:
+            state = getattr(self, "_channel_state", {}).get(str(channel_id), {})
+            chat_type = state.get("chat_type", "group")
+        return _resolve_effective_reply_mode(
+            self._channel_modes,
+            channel_id,
+            reply_to_mode=self._reply_to_mode,
             chat_type=chat_type,
         )
 
@@ -1215,10 +1257,12 @@ class BuzzAdapter(BasePlatformAdapter):
     async def send(self, chat_id: str, content: str, reply_to: Optional[str] = None, metadata: Optional[Dict[str, Any]] = None) -> SendResult:
         if not content:
             return SendResult(success=False, error="Empty message")
-        # Anchor: metadata.thread_id, then metadata.reply_to_message_id (stream/progress sends), then reply_to.
-        meta = metadata or {}
         args = ["messages", "send", "--channel", str(chat_id), "--content", "-"]
-        args += self._reply_args(meta.get("thread_id") or meta.get("reply_to_message_id") or reply_to)
+        reply_target = self._resolve_outbound_reply_anchor(
+            str(chat_id), reply_to, metadata
+        )
+        if reply_target:
+            args += ["--reply-to", str(reply_target)]
         mention_pubkeys = await self._mention_pubkeys_for(chat_id, content)
         code, out, err = await self._run_message_send(args, content, mention_pubkeys)
         result = self._send_result(chat_id, code, out, err)
@@ -1226,11 +1270,6 @@ class BuzzAdapter(BasePlatformAdapter):
             # Record event_meta so a thread reply to this send matches even if the echo never arrives.
             self._remember_event_meta(str(chat_id), result.message_id, self._self_pubkey, content)
         return result
-
-    def _reply_args(self, anchor: Optional[str]) -> List[str]:
-        """``--reply-to`` CLI args for *anchor*, honoring ``reply_to_mode``."""
-        reply_target = self._resolve_reply_anchor(anchor)
-        return ["--reply-to", str(reply_target)] if reply_target and self._reply_to_mode != "off" else []
 
     def _send_result(self, chat_id: str, code: int, out: str, err: str, *, redact_path: Optional[Path] = None) -> SendResult:
         """``messages send`` result -> SendResult; marks the verified id seen (echo suppression belt-and-braces)."""
@@ -1291,6 +1330,23 @@ class BuzzAdapter(BasePlatformAdapter):
             self._mark_seen(str(chat_id), str(data["event_id"]))
         return bool(data.get("accepted", True))
 
+    async def _send_local_file(
+        self,
+        chat_id: str,
+        file_path: str,
+        caption: Optional[str] = None,
+        reply_to: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> SendResult:
+        """Compatibility seam for native file sends, sharing the current attachment path."""
+        return await self._send_file_attachment(
+            chat_id,
+            Path(file_path),
+            caption=caption,
+            reply_to=reply_to,
+            metadata=metadata,
+        )
+
     async def send_image(
         self, chat_id: str, image_url: str, caption: Optional[str] = None, reply_to: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None) -> SendResult:
@@ -1314,8 +1370,17 @@ class BuzzAdapter(BasePlatformAdapter):
         if probe and not local.is_file():
             # Never leak host filesystem paths into chat-visible errors.
             return SendResult(success=False, error="Media file not found")
-        args = ["messages", "send", "--channel", str(chat_id), "--file", str(local), "--content", "-"]
-        args += self._reply_args((metadata or {}).get("thread_id") or reply_to)
+        args = [
+            "messages", "send",
+            "--channel", str(chat_id),
+            "--file", str(local),
+            "--content", "-",
+        ]
+        reply_target = self._resolve_outbound_reply_anchor(
+            str(chat_id), reply_to, metadata
+        )
+        if reply_target:
+            args += ["--reply-to", str(reply_target)]
         code, out, err = await self._run_message_send(args, caption or "")
         return self._send_result(chat_id, code, out, err, redact_path=local)
 
@@ -2081,6 +2146,60 @@ class BuzzAdapter(BasePlatformAdapter):
         """Thread root when the trigger was inside a thread (reply joins it), else the anchor unchanged."""
         return (self._thread_roots.get(str(anchor)) or anchor) if anchor else anchor
 
+    def _resolve_outbound_reply_anchor(
+        self,
+        chat_id: str,
+        reply_to: Optional[str],
+        metadata: Optional[Dict[str, Any]],
+    ) -> Optional[str]:
+        """Apply the channel policy to an outbound reply-capable send.
+
+        Gateway-originated sends carry both the triggering event and explicit
+        placement provenance. The stable NIP-10 root is therefore durable in
+        metadata and does not depend on this adapter instance's bounded cache.
+        Legacy/synthetic threaded sends retain their existing cache fallback.
+        Hybrid sends fail flat when provenance is missing, except that an
+        explicit ``metadata.thread_id`` is a supported synthetic thread target.
+        """
+        mode = self.effective_reply_mode(str(chat_id))
+        if mode == "flat":
+            return None
+
+        meta = metadata if isinstance(metadata, dict) else {}
+        placement = str(meta.get("buzz_trigger_placement") or "").strip().lower()
+        if placement not in {"top_level", "in_thread"}:
+            placement = ""
+        thread_target = str(meta.get("thread_id") or "").strip() or None
+        trigger = (
+            str(meta.get("reply_to_message_id") or "").strip()
+            or str(reply_to or "").strip()
+            or None
+        )
+
+        if mode == "hybrid":
+            if placement == "top_level":
+                return None
+            if placement == "in_thread":
+                if thread_target:
+                    return thread_target
+                roots = getattr(self, "_thread_roots", None) or {}
+                return roots.get(trigger) if trigger else None
+            # A caller can deliberately name a durable thread without an
+            # inbound origin (cron/home-channel/synthetic delivery). Bare
+            # reply_to is not sufficient evidence that a thread exists.
+            return thread_target
+
+        # Threaded policy: explicit provenance wins and preserves a stable
+        # root. Calls from older gateway paths retain the historical mapping
+        # of a trigger event through the in-memory root cache.
+        if placement == "in_thread" and thread_target:
+            return thread_target
+        if placement == "top_level":
+            return trigger
+        if thread_target:
+            return thread_target
+        return self._resolve_reply_anchor(trigger)
+
     def _remember_event(self, state: dict, event: dict) -> None:
         """Record author + content snippet for later NIP-10 parent lookup."""
         event_id = str(event.get("id") or "")
@@ -2189,7 +2308,7 @@ class BuzzAdapter(BasePlatformAdapter):
             message_type = MessageType.DOCUMENT
         source = self.build_source(
             chat_id=chat_id, chat_name=self._channel_names.get(chat_id, chat_id), chat_type=chat_type,
-            user_id=user_id, user_name=user_name, thread_id=thread_id,
+            user_id=user_id, user_name=user_name, thread_id=thread_id, message_id=message_id,
         )
         event = MessageEvent(
             text=text, message_type=message_type, source=source, raw_message=raw_message, message_id=message_id,
@@ -2339,8 +2458,18 @@ async def _standalone_send(
     if not (target := (chat_id or "").strip() or _configured_home_channel(extra)):
         return {"error": "Buzz standalone send: no target channel (set BUZZ_HOME_CHANNEL)"}
     args = ["messages", "send", "--channel", target, "--content", "-"]
-    # Same reply_to_mode / reply_in_thread gate as the live adapter.
-    if thread_id and _reply_to_mode(pconfig, extra) != "off":
+    try:
+        channel_modes = _validate_channel_modes(extra.get("channel_modes"))
+    except ValueError as exc:
+        return {"error": f"Buzz standalone send: {exc}"}
+    reply_mode = _resolve_effective_reply_mode(
+        channel_modes,
+        target,
+        reply_to_mode=_reply_to_mode(pconfig, extra),
+    )
+    # A standalone caller-supplied thread_id is an explicit durable target,
+    # so both threaded and hybrid modes may use it without inbound provenance.
+    if thread_id and reply_mode != "flat":
         args += ["--reply-to", str(thread_id)]
     for media in media_files or []:
         args += ["--file", str(media[0] if isinstance(media, (list, tuple)) and media else media)]
