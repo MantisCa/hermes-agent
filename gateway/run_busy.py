@@ -741,7 +741,9 @@ class GatewayBusySessionMixin:
 
     def _plugin_source_identity_candidates(self, source: SessionSource) -> tuple[str, ...]:
         """Resolve adapter-normalized sender identities without exposing the adapter."""
-        adapter = self._authorization_adapter(source.platform, source.profile)
+        # Normalize through the actual receiving transport: its runtime profile may differ from
+        # the routed config/profile identity on a shared multiplexed adapter.
+        adapter = self._adapter_for_source(source)
         normalize = getattr(adapter, "normalize_source_identity_candidates", None)
         if callable(normalize):
             try:
@@ -756,6 +758,14 @@ class GatewayBusySessionMixin:
             if normalized and normalized not in candidates:
                 candidates.append(normalized)
         return tuple(candidates)
+
+    def _plugin_transport_profile(self, source: SessionSource) -> str:
+        """Return the opaque registry identity of the source transport owner."""
+        owner = self._transport_owner(source)
+        if owner is not None:
+            _adapter, profile = owner
+            return str(profile or getattr(self, "_primary_profile_name", None) or "default")
+        return self._plugin_routed_profile(source)
 
     def _plugin_routed_profile(self, source: SessionSource) -> str:
         """Return the routed profile identity, never a profile filesystem path."""
@@ -821,40 +831,45 @@ class GatewayBusySessionMixin:
             return profile, get_hermes_home()
         return profile, get_profile_dir(profile)
 
-    def _plugin_channel_policy_target(self, platform: str, routed_profile: str):
-        """Resolve one validated, currently connected profile adapter."""
+    def _plugin_channel_policy_target(
+        self,
+        platform: str,
+        routed_profile: str,
+        transport_profile: Optional[str] = None,
+    ):
+        """Resolve routed config ownership and the connected transport owner."""
         try:
             from gateway.config import Platform
+            from hermes_cli.profiles import normalize_profile_name, validate_profile_name
 
             platform_enum = Platform(str(platform or "").strip().lower())
             profile, profile_home = self._plugin_profile_home(routed_profile)
+            live_profile = normalize_profile_name(transport_profile or profile)
+            validate_profile_name(live_profile)
         except Exception:
-            return None, None, None, {
+            return None, None, None, None, {
                 "ok": False,
                 "error": "invalid_argument",
-                "detail": "platform or routed profile is invalid",
+                "detail": "platform, routed profile, or transport profile is invalid",
             }
-        adapter = self._authorization_adapter(platform_enum, profile)
+        adapter = self._authorization_adapter(platform_enum, live_profile)
         if adapter is None:
-            return None, None, None, {
+            return None, None, None, None, {
                 "ok": False,
                 "error": "adapter_not_registered",
-                "detail": (
-                    f"no {platform_enum.value} adapter is registered for "
-                    f"profile {profile!r}"
-                ),
+                "detail": f"no {platform_enum.value} adapter is registered for this source transport",
             }
         try:
             connected = bool(adapter.is_connected)
         except Exception:
             connected = False
         if not connected:
-            return None, None, None, {
+            return None, None, None, None, {
                 "ok": False,
                 "error": "adapter_disconnected",
                 "detail": f"the {platform_enum.value} adapter is not connected",
             }
-        return platform_enum, profile, profile_home, None
+        return platform_enum, profile, profile_home, live_profile, None
 
     @staticmethod
     def _plugin_platform_extra_from_raw(raw: dict, platform: str) -> dict:
@@ -889,8 +904,10 @@ class GatewayBusySessionMixin:
         return merged
 
     @staticmethod
-    def _plugin_channel_modes_node(raw: dict, platform: str) -> tuple[dict, dict]:
-        """Return canonical ``extra`` and its current channel_modes mapping."""
+    def _plugin_channel_modes_node(
+        raw: dict, platform: str,
+    ) -> tuple[dict, dict, tuple[dict, ...]]:
+        """Return canonical ``extra``, effective modes, and higher-precedence nodes."""
         node = raw
         for segment in ("gateway", "platforms", platform, "extra"):
             child = node.get(segment)
@@ -903,10 +920,34 @@ class GatewayBusySessionMixin:
                     f"{segment!r} is not a mapping"
                 )
             node = child
-        modes = node.get("channel_modes")
+        modes = node.get("channel_modes", {})
+        shadowing_nodes: list[dict] = []
+        gateway = raw.get("gateway") if isinstance(raw, dict) else None
+        top_platforms = raw.get("platforms") if isinstance(raw, dict) else None
+        for parent in (top_platforms, gateway):
+            block = parent.get(platform) if isinstance(parent, dict) else None
+            extra = block.get("extra") if isinstance(block, dict) else None
+            if isinstance(extra, dict) and extra is not node and "channel_modes" in extra:
+                modes = extra.get("channel_modes")
+                shadowing_nodes.append(extra)
         if modes is None:
             modes = {}
-        return node, modes
+        return node, modes, tuple(shadowing_nodes)
+
+    def _plugin_channel_policy_operation_lock(
+        self, routed_profile: str, platform: str,
+    ) -> asyncio.Lock:
+        """Return the in-process persist-through-live-apply serialization lock."""
+        locks = getattr(self, "_plugin_channel_policy_operation_locks", None)
+        if not isinstance(locks, dict):
+            locks = {}
+            self._plugin_channel_policy_operation_locks = locks
+        key = (str(routed_profile), str(platform))
+        lock = locks.get(key)
+        if lock is None:
+            lock = asyncio.Lock()
+            locks[key] = lock
+        return lock
 
     @staticmethod
     def _plugin_channel_policy_capability_granted(plugin_id: str, raw: dict) -> bool:
@@ -924,6 +965,7 @@ class GatewayBusySessionMixin:
         plugin_id: str,
         platform: str,
         routed_profile: str,
+        transport_profile: Optional[str] = None,
         channel_id: str,
         thread_id: Optional[str],
         chat_type: str,
@@ -931,8 +973,10 @@ class GatewayBusySessionMixin:
     ) -> dict:
         """Return current adapter policy through a capability-gated read path."""
         del thread_id, source_identity_candidates
-        platform_enum, _profile, profile_home, error = self._plugin_channel_policy_target(
-            platform, routed_profile
+        platform_enum, profile, profile_home, live_profile, error = (
+            self._plugin_channel_policy_target(
+                platform, routed_profile, transport_profile
+            )
         )
         if error is not None:
             return error
@@ -948,7 +992,7 @@ class GatewayBusySessionMixin:
                 "error": "capability_not_granted",
                 "detail": f"plugin {plugin_id!r} lacks gateway.platform_actions",
             }
-        adapter = self._authorization_adapter(platform_enum, routed_profile)
+        adapter = self._authorization_adapter(platform_enum, live_profile)
         status_fn = getattr(adapter, "channel_policy_status", None)
         if not callable(status_fn):
             return {
@@ -957,7 +1001,11 @@ class GatewayBusySessionMixin:
                 "detail": f"{platform_enum.value} does not expose channel policy status",
             }
         try:
-            status = status_fn(channel_id, chat_type=chat_type)
+            status = status_fn(
+                channel_id,
+                chat_type=chat_type,
+                routed_profile=profile,
+            )
         except Exception as exc:
             return {"ok": False, "error": "action_failed", "detail": str(exc)[:512]}
         return {"ok": True, "status": status}
@@ -996,7 +1044,9 @@ class GatewayBusySessionMixin:
                         "an explicitly configured group administrator is required"
                     )
 
-                extra, current_raw = self._plugin_channel_modes_node(raw, platform)
+                extra, current_raw, shadowing_nodes = (
+                    self._plugin_channel_modes_node(raw, platform)
+                )
                 current = validator(current_raw)
                 policy = str(policy or "").strip().lower()
                 normalized_value = str(value or "").strip().lower()
@@ -1025,12 +1075,18 @@ class GatewayBusySessionMixin:
                     raise RuntimeError(
                         "config.yaml changed outside the supported mutation lock; retry the command"
                     )
-                if current_raw == current and validated == current:
+                if (
+                    current_raw == current
+                    and validated == current
+                    and not shadowing_nodes
+                ):
                     return canonical_channel, candidate_value
                 if validated:
                     extra["channel_modes"] = validated
                 else:
                     extra.pop("channel_modes", None)
+                for shadowing_extra in shadowing_nodes:
+                    shadowing_extra.pop("channel_modes", None)
                 config_mod.atomic_config_write(config_path, raw, sort_keys=False)
                 return canonical_channel, candidate_value
 
@@ -1040,6 +1096,7 @@ class GatewayBusySessionMixin:
         plugin_id: str,
         platform: str,
         routed_profile: str,
+        transport_profile: Optional[str] = None,
         channel_id: str,
         thread_id: Optional[str],
         chat_type: str,
@@ -1061,71 +1118,102 @@ class GatewayBusySessionMixin:
                 "error": "explicit_admin_required",
                 "detail": "no normalized sender identity is available",
             }
-        platform_enum, profile, profile_home, error = self._plugin_channel_policy_target(
-            platform, routed_profile
+        platform_enum, profile, profile_home, live_profile, error = (
+            self._plugin_channel_policy_target(
+                platform, routed_profile, transport_profile
+            )
         )
         if error is not None:
             return error
-        initial_adapter = self._authorization_adapter(platform_enum, profile)
-        validator = getattr(initial_adapter, "validate_channel_modes", None)
-        if not callable(validator):
-            return {
-                "ok": False,
-                "error": "unsupported_platform_action",
-                "detail": f"{platform_enum.value} does not support channel policies",
-            }
-        try:
-            canonical_channel, applied_value = await asyncio.to_thread(
-                self._persist_plugin_channel_policy,
-                plugin_id=plugin_id,
-                platform=platform_enum.value,
-                profile_home=profile_home,
-                channel_id=channel_id,
-                policy=policy,
-                value=value,
-                source_identity_candidates=source_identity_candidates,
-                validator=validator,
+        operation_lock = self._plugin_channel_policy_operation_lock(
+            profile, platform_enum.value
+        )
+        async with operation_lock:
+            initial_adapter = self._authorization_adapter(
+                platform_enum, live_profile
             )
-        except LookupError as exc:
-            return {"ok": False, "error": "capability_not_granted", "detail": str(exc)[:512]}
-        except PermissionError as exc:
-            return {"ok": False, "error": "explicit_admin_required", "detail": str(exc)[:512]}
-        except Exception as exc:
-            return {"ok": False, "error": "persistence_failed", "detail": str(exc)[:512]}
+            validator = getattr(initial_adapter, "validate_channel_modes", None)
+            if not callable(validator):
+                return {
+                    "ok": False,
+                    "error": "unsupported_platform_action",
+                    "detail": f"{platform_enum.value} does not support channel policies",
+                }
+            try:
+                canonical_channel, applied_value = await asyncio.to_thread(
+                    self._persist_plugin_channel_policy,
+                    plugin_id=plugin_id,
+                    platform=platform_enum.value,
+                    profile_home=profile_home,
+                    channel_id=channel_id,
+                    policy=policy,
+                    value=value,
+                    source_identity_candidates=source_identity_candidates,
+                    validator=validator,
+                )
+            except LookupError as exc:
+                return {
+                    "ok": False,
+                    "error": "capability_not_granted",
+                    "detail": str(exc)[:512],
+                }
+            except PermissionError as exc:
+                return {
+                    "ok": False,
+                    "error": "explicit_admin_required",
+                    "detail": str(exc)[:512],
+                }
+            except Exception as exc:
+                return {
+                    "ok": False,
+                    "error": "persistence_failed",
+                    "detail": str(exc)[:512],
+                }
 
-        current_adapter = self._authorization_adapter(platform_enum, profile)
-        apply_fn = getattr(current_adapter, "apply_channel_policy", None)
-        status_fn = getattr(current_adapter, "channel_policy_status", None)
-        try:
-            connected = bool(current_adapter and current_adapter.is_connected)
-        except Exception:
-            connected = False
-        if not connected or not callable(apply_fn) or not callable(status_fn):
+            current_adapter = self._authorization_adapter(
+                platform_enum, live_profile
+            )
+            apply_fn = getattr(current_adapter, "apply_channel_policy", None)
+            status_fn = getattr(current_adapter, "channel_policy_status", None)
+            try:
+                connected = bool(current_adapter and current_adapter.is_connected)
+            except Exception:
+                connected = False
+            if not connected or not callable(apply_fn) or not callable(status_fn):
+                return {
+                    "ok": True,
+                    "persisted": True,
+                    "live_applied": False,
+                    "restart_required": True,
+                    "detail": "the current adapter changed or disconnected after persistence",
+                }
+            try:
+                apply_fn(
+                    canonical_channel,
+                    policy,
+                    applied_value,
+                    routed_profile=profile,
+                )
+                status = status_fn(
+                    canonical_channel,
+                    chat_type=chat_type,
+                    routed_profile=profile,
+                )
+            except Exception as exc:
+                return {
+                    "ok": True,
+                    "persisted": True,
+                    "live_applied": False,
+                    "restart_required": True,
+                    "detail": str(exc)[:512],
+                }
             return {
                 "ok": True,
                 "persisted": True,
-                "live_applied": False,
-                "restart_required": True,
-                "detail": "the current adapter changed or disconnected after persistence",
+                "live_applied": True,
+                "restart_required": False,
+                "status": status,
             }
-        try:
-            apply_fn(canonical_channel, policy, applied_value)
-            status = status_fn(canonical_channel, chat_type=chat_type)
-        except Exception as exc:
-            return {
-                "ok": True,
-                "persisted": True,
-                "live_applied": False,
-                "restart_required": True,
-                "detail": str(exc)[:512],
-            }
-        return {
-            "ok": True,
-            "persisted": True,
-            "live_applied": True,
-            "restart_required": False,
-            "status": status,
-        }
 
     async def _dispatch_registered_plugin_command(
         self, event: MessageEvent, source: SessionSource, command_name: str,
@@ -1142,6 +1230,7 @@ class GatewayBusySessionMixin:
         if entry.get("with_context"):
             platform = source.platform.value if source.platform else ""
             profile = self._plugin_routed_profile(source)
+            transport_profile = self._plugin_transport_profile(source)
             identity_candidates = self._plugin_source_identity_candidates(source)
             invocation = PluginCommandInvocation(
                 platform=platform,
@@ -1164,6 +1253,7 @@ class GatewayBusySessionMixin:
                     ),
                     chat_type=str(source.chat_type or ""),
                     routed_profile=profile,
+                    transport_profile=transport_profile,
                     source_identity_candidates=identity_candidates,
                 ),
             )
@@ -1348,6 +1438,22 @@ class GatewayBusySessionMixin:
         if not _loop_arg or _loop_arg in {"status", "pause", "resume", "stop", "clear", "cancel", "help", "--help", "-h"}:
             return await self._handle_loop_command(event)
         return "Agent is running — use /loop status / pause / stop mid-run, or /stop before setting a new loop."
+
+    def _check_slash_access_compat(
+        self, source: SessionSource, canonical_cmd: str, raw_args: str
+    ) -> Optional[str]:
+        """Call argument-aware access while tolerating legacy test doubles."""
+        checker = self._check_slash_access
+        try:
+            parameters = tuple(inspect.signature(checker).parameters.values())
+        except (TypeError, ValueError):
+            parameters = ()
+        if parameters and not any(
+            parameter.kind is inspect.Parameter.VAR_POSITIONAL
+            for parameter in parameters
+        ) and len(parameters) < 3:
+            return checker(source, canonical_cmd)
+        return checker(source, canonical_cmd, raw_args)
 
     def _check_slash_access(
         self, source: SessionSource, canonical_cmd: str, raw_args: str = "",

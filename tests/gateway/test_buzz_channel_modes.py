@@ -3,13 +3,15 @@
 from __future__ import annotations
 
 import asyncio
+import threading
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 import yaml
 
-from gateway.config import Platform, PlatformConfig
+from gateway.config import Platform, PlatformConfig, load_gateway_config
+from gateway.profile_routing import ProfileRoute
 from gateway.run import GatewayRunner
 from tests.gateway._plugin_adapter_loader import load_plugin_adapter
 
@@ -151,6 +153,29 @@ def test_command_status_and_mutation_use_source_bound_actions():
     actions.set_channel_policy.assert_awaited_once_with("listen", "always")
 
 
+def test_command_reports_persisted_restart_requirement_without_status():
+    actions = SimpleNamespace(
+        set_channel_policy=AsyncMock(
+            return_value={
+                "ok": True,
+                "persisted": True,
+                "live_applied": False,
+                "restart_required": True,
+            }
+        )
+    )
+    invocation = SimpleNamespace(
+        platform="buzz",
+        chat_type="channel",
+        platform_actions=actions,
+    )
+
+    text = asyncio.run(_buzz._handle_buzz_command("listen always", invocation))
+
+    assert text == "Saved, but the live adapter could not be updated; restart required."
+    actions.set_channel_policy.assert_awaited_once_with("listen", "always")
+
+
 def test_command_dm_mutation_is_a_noop_and_malformed_returns_usage():
     actions = SimpleNamespace(
         get_channel_policy_status=AsyncMock(),
@@ -244,6 +269,275 @@ def _runner_for_profiles(default_adapter, profile_adapters=None):
     return runner
 
 
+def _restart_adapter(home, monkeypatch):
+    monkeypatch.setattr("gateway.config.get_hermes_home", lambda: home)
+    config = load_gateway_config()
+    return BuzzAdapter(config.platforms[Platform("buzz")])
+
+
+@pytest.mark.asyncio
+async def test_real_status_service_returns_effective_buzz_policy(tmp_path, monkeypatch):
+    home = tmp_path / "default"
+    home.mkdir()
+    raw = _raw_profile_config()
+    raw["gateway"]["platforms"]["buzz"]["extra"]["channel_modes"] = {
+        CHANNEL: {"listen": "always", "replies": "hybrid"}
+    }
+    (home / "config.yaml").write_text(yaml.safe_dump(raw))
+    adapter = _adapter(
+        extra={"channel_modes": raw["gateway"]["platforms"]["buzz"]["extra"]["channel_modes"]}
+    )
+    adapter._running = True
+    runner = _runner_for_profiles(adapter)
+    monkeypatch.setattr("hermes_cli.profiles.get_profile_dir", lambda _name: home)
+
+    result = await runner._get_plugin_channel_policy_status_action(
+        plugin_id="buzz-platform",
+        platform="buzz",
+        routed_profile="default",
+        channel_id=CHANNEL,
+        thread_id=None,
+        chat_type="group",
+        source_identity_candidates=(ADMIN_HEX, ADMIN_NPUB),
+    )
+
+    assert result == {
+        "ok": True,
+        "status": {
+            "applicable": True,
+            "listen": {"effective": "always", "source": "explicit"},
+            "replies": {"effective": "hybrid", "source": "explicit"},
+        },
+    }
+
+
+@pytest.mark.asyncio
+async def test_real_status_service_denies_routed_profile_without_capability(
+    tmp_path, monkeypatch
+):
+    default_home = tmp_path / "default"
+    team_home = tmp_path / "profiles" / "team-b"
+    default_home.mkdir()
+    team_home.mkdir(parents=True)
+    (default_home / "config.yaml").write_text(yaml.safe_dump(_raw_profile_config()))
+    team_raw = _raw_profile_config()
+    team_raw["plugins"]["entries"]["buzz-platform"]["granted_capabilities"] = []
+    (team_home / "config.yaml").write_text(yaml.safe_dump(team_raw))
+    default_adapter = _adapter()
+    team_adapter = _adapter()
+    default_adapter._running = team_adapter._running = True
+    runner = _runner_for_profiles(
+        default_adapter,
+        {"team-b": {Platform("buzz"): team_adapter}},
+    )
+    monkeypatch.setattr(
+        "hermes_cli.profiles.get_profile_dir",
+        lambda name: team_home if name == "team-b" else default_home,
+    )
+
+    result = await runner._get_plugin_channel_policy_status_action(
+        plugin_id="buzz-platform",
+        platform="buzz",
+        routed_profile="team-b",
+        channel_id=CHANNEL,
+        thread_id=None,
+        chat_type="group",
+        source_identity_candidates=(ADMIN_HEX, ADMIN_NPUB),
+    )
+
+    assert result["ok"] is False
+    assert result["error"] == "capability_not_granted"
+
+
+@pytest.mark.asyncio
+async def test_shared_primary_transport_uses_routed_authority_and_live_policy(
+    tmp_path, monkeypatch
+):
+    default_home = tmp_path / "default"
+    team_home = tmp_path / "profiles" / "team-b"
+    default_home.mkdir()
+    team_home.mkdir(parents=True)
+    (default_home / "config.yaml").write_text(yaml.safe_dump(_raw_profile_config()))
+    team_modes = {CHANNEL: {"listen": "always"}}
+    team_raw = _raw_profile_config()
+    team_raw["gateway"]["platforms"]["buzz"]["extra"]["channel_modes"] = team_modes
+    (team_home / "config.yaml").write_text(yaml.safe_dump(team_raw))
+
+    transport_adapter = _adapter()
+    transport_adapter._running = True
+    transport_adapter.hydrate_routed_profile_config(
+        "team-b",
+        PlatformConfig(enabled=False, extra={"channel_modes": team_modes}),
+    )
+    runner = _runner_for_profiles(transport_adapter)
+    runner.config = SimpleNamespace(
+        multiplex_profiles=True,
+        profile_routes=[
+            ProfileRoute(
+                name="buzz-team",
+                platform="buzz",
+                profile="team-b",
+                chat_id=CHANNEL,
+            )
+        ],
+    )
+    transport_adapter.gateway_runner = runner
+    monkeypatch.setattr(
+        "gateway.run._multiplex_profile_homes",
+        lambda _config: [("default", default_home), ("team-b", team_home)],
+    )
+    monkeypatch.setattr(
+        "hermes_cli.profiles.get_profile_dir",
+        lambda name: team_home if name == "team-b" else default_home,
+    )
+
+    source = transport_adapter.build_source(
+        chat_id=CHANNEL,
+        chat_type="group",
+        user_id=ADMIN_HEX.upper(),
+        message_id="event-1",
+    )
+    assert source.profile == "team-b"
+    assert runner._plugin_transport_profile(source) == "default"
+    assert runner._plugin_source_identity_candidates(source) == (
+        ADMIN_HEX,
+        ADMIN_NPUB,
+    )
+
+    before = await runner._get_plugin_channel_policy_status_action(
+        plugin_id="buzz-platform",
+        platform="buzz",
+        routed_profile="team-b",
+        transport_profile="default",
+        channel_id=CHANNEL,
+        thread_id=None,
+        chat_type="group",
+        source_identity_candidates=(ADMIN_HEX, ADMIN_NPUB),
+    )
+    changed = await runner._apply_plugin_channel_policy_action(
+        plugin_id="buzz-platform",
+        platform="buzz",
+        routed_profile="team-b",
+        transport_profile="default",
+        channel_id=CHANNEL,
+        thread_id=None,
+        chat_type="group",
+        source_identity_candidates=(ADMIN_HEX, ADMIN_NPUB),
+        policy="replies",
+        value="hybrid",
+    )
+
+    assert before["status"]["listen"] == {
+        "effective": "always",
+        "source": "explicit",
+    }
+    assert changed["ok"] is True
+    assert changed["live_applied"] is True
+    persisted = yaml.safe_load((team_home / "config.yaml").read_text())
+    assert persisted["gateway"]["platforms"]["buzz"]["extra"]["channel_modes"] == {
+        CHANNEL: {"listen": "always", "replies": "hybrid"}
+    }
+    assert transport_adapter._channel_modes == {}
+    assert transport_adapter._routed_channel_modes["team-b"] == {
+        CHANNEL: {"listen": "always", "replies": "hybrid"}
+    }
+    assert (
+        transport_adapter._resolve_outbound_reply_anchor(
+            CHANNEL,
+            "event-1",
+            {
+                "hermes_profile": "team-b",
+                "buzz_trigger_placement": "top_level",
+                "reply_to_message_id": "event-1",
+            },
+        )
+        is None
+    )
+
+
+@pytest.mark.asyncio
+async def test_shared_transport_restart_hydrates_routed_policy_before_intake(
+    tmp_path, monkeypatch
+):
+    default_home = tmp_path / "default"
+    team_home = tmp_path / "profiles" / "team-b"
+    default_home.mkdir()
+    team_home.mkdir(parents=True)
+    (default_home / "config.yaml").write_text(yaml.safe_dump(_raw_profile_config()))
+    team_raw = _raw_profile_config()
+    team_raw["gateway"]["platforms"]["buzz"]["enabled"] = True
+    team_raw["gateway"]["platforms"]["buzz"]["extra"]["channel_modes"] = {
+        CHANNEL: {"listen": "always"}
+    }
+    (team_home / "config.yaml").write_text(yaml.safe_dump(team_raw))
+
+    restarted_transport = _adapter()
+    runner = _runner_for_profiles(restarted_transport)
+    runner.config = SimpleNamespace(
+        multiplex_profiles=True,
+        profile_routes=[
+            ProfileRoute(
+                name="buzz-team",
+                platform="buzz",
+                profile="team-b",
+                chat_id=CHANNEL,
+            )
+        ],
+    )
+    restarted_transport.gateway_runner = runner
+    monkeypatch.setattr(
+        "gateway.run._multiplex_profile_homes",
+        lambda _config: [("default", default_home), ("team-b", team_home)],
+    )
+
+    runner._hydrate_shared_adapter_routed_profile_configs(
+        restarted_transport,
+        Platform("buzz"),
+    )
+
+    assert restarted_transport.channel_policy_status(
+        CHANNEL,
+        routed_profile="team-b",
+    )["listen"] == {"effective": "always", "source": "explicit"}
+    assert restarted_transport.is_connected is False
+
+    handler = AsyncMock(return_value=None)
+    restarted_transport._running = True
+    restarted_transport.set_message_handler(handler)
+    restarted_transport.set_authorization_check(lambda *_args: True)
+    restarted_transport._self_pubkey = "b" * 64
+    restarted_transport._self_npub = _buzz.hex_to_npub("b" * 64) or ""
+    restarted_transport._display_name = "Gaal"
+    monkeypatch.setattr(
+        restarted_transport,
+        "_resolve_user_name",
+        AsyncMock(return_value="Admin"),
+    )
+    monkeypatch.setattr(
+        restarted_transport,
+        "send_reaction",
+        AsyncMock(return_value=True),
+    )
+    state = restarted_transport._new_channel_state("group")
+
+    await restarted_transport._handle_event(
+        CHANNEL,
+        state,
+        {
+            "id": "ambient-after-restart",
+            "pubkey": ADMIN_HEX,
+            "content": "ambient routed message",
+            "created_at": 1,
+            "kind": 9,
+            "tags": [["h", CHANNEL]],
+        },
+    )
+    await asyncio.gather(*list(restarted_transport._session_tasks.values()))
+
+    handler.assert_awaited_once()
+    assert handler.await_args.args[0].source.profile == "team-b"
+
+
 @pytest.mark.asyncio
 async def test_mutation_persists_sparse_routed_profile_then_updates_live_adapter(
     tmp_path, monkeypatch
@@ -292,6 +586,167 @@ async def test_mutation_persists_sparse_routed_profile_then_updates_live_adapter
     assert team_adapter._channel_modes == {CHANNEL: {"listen": "always"}}
     assert default_adapter._channel_modes == {}
     assert (default_home / "config.yaml").read_bytes() == default_before
+
+
+@pytest.mark.asyncio
+async def test_top_level_platform_modes_migrate_on_set_and_stay_reset_after_restart(
+    tmp_path, monkeypatch
+):
+    home = tmp_path / "default"
+    home.mkdir()
+    raw = _raw_profile_config()
+    raw["gateway"]["platforms"]["buzz"]["enabled"] = True
+    top_modes = {CHANNEL: {"listen": "mentions", "replies": "hybrid"}}
+    raw["platforms"] = {
+        "buzz": {
+            "extra": {
+                "channel_modes": top_modes,
+                "top_level_setting": "preserved",
+            }
+        }
+    }
+    config_path = home / "config.yaml"
+    config_path.write_text(yaml.safe_dump(raw))
+    adapter = _adapter(extra={"channel_modes": top_modes})
+    adapter._running = True
+    runner = _runner_for_profiles(adapter)
+    monkeypatch.setattr("hermes_cli.profiles.get_profile_dir", lambda _name: home)
+
+    set_result = await runner._apply_plugin_channel_policy_action(
+        plugin_id="buzz-platform",
+        platform="buzz",
+        routed_profile="default",
+        channel_id=CHANNEL,
+        thread_id=None,
+        chat_type="group",
+        source_identity_candidates=(ADMIN_HEX, ADMIN_NPUB),
+        policy="listen",
+        value="always",
+    )
+
+    assert set_result["ok"] is True
+    persisted = yaml.safe_load(config_path.read_text())
+    assert persisted["gateway"]["platforms"]["buzz"]["extra"]["channel_modes"] == {
+        CHANNEL: {"listen": "always", "replies": "hybrid"}
+    }
+    assert "channel_modes" not in persisted["platforms"]["buzz"]["extra"]
+    assert (
+        persisted["platforms"]["buzz"]["extra"]["top_level_setting"]
+        == "preserved"
+    )
+    restarted = _restart_adapter(home, monkeypatch)
+    assert restarted.channel_policy_status(CHANNEL)["listen"] == {
+        "effective": "always",
+        "source": "explicit",
+    }
+
+    reset_result = await runner._apply_plugin_channel_policy_action(
+        plugin_id="buzz-platform",
+        platform="buzz",
+        routed_profile="default",
+        channel_id=CHANNEL,
+        thread_id=None,
+        chat_type="group",
+        source_identity_candidates=(ADMIN_HEX, ADMIN_NPUB),
+        policy="listen",
+        value="reset",
+    )
+
+    assert reset_result["ok"] is True
+    restarted_after_reset = _restart_adapter(home, monkeypatch)
+    assert restarted_after_reset.channel_policy_status(CHANNEL) == {
+        "applicable": True,
+        "listen": {"effective": "mentions", "source": "inherited"},
+        "replies": {"effective": "hybrid", "source": "explicit"},
+    }
+
+
+@pytest.mark.asyncio
+async def test_duplicate_mode_nodes_migrate_to_canonical_and_reset_without_shadow(
+    tmp_path, monkeypatch
+):
+    home = tmp_path / "default"
+    home.mkdir()
+    raw = _raw_profile_config()
+    raw["gateway"]["platforms"]["buzz"]["enabled"] = True
+    raw["gateway"]["platforms"]["buzz"]["extra"]["channel_modes"] = {
+        CHANNEL: {"listen": "mentions"}
+    }
+    raw["platforms"] = {
+        "buzz": {
+            "extra": {
+                "channel_modes": {CHANNEL: {"listen": "mentions", "replies": "threaded"}},
+                "top_level_setting": "preserved",
+            }
+        }
+    }
+    raw["gateway"]["buzz"] = {
+        "extra": {
+            "channel_modes": {CHANNEL: {"listen": "always"}},
+            "direct_setting": "preserved",
+        }
+    }
+    config_path = home / "config.yaml"
+    config_path.write_text(yaml.safe_dump(raw))
+    adapter = _adapter(extra={"channel_modes": {CHANNEL: {"listen": "always"}}})
+    adapter._running = True
+    runner = _runner_for_profiles(adapter)
+    monkeypatch.setattr("hermes_cli.profiles.get_profile_dir", lambda _name: home)
+
+    set_result = await runner._apply_plugin_channel_policy_action(
+        plugin_id="buzz-platform",
+        platform="buzz",
+        routed_profile="default",
+        channel_id=CHANNEL,
+        thread_id=None,
+        chat_type="group",
+        source_identity_candidates=(ADMIN_HEX, ADMIN_NPUB),
+        policy="replies",
+        value="hybrid",
+    )
+
+    assert set_result["ok"] is True
+    persisted = yaml.safe_load(config_path.read_text())
+    assert persisted["gateway"]["platforms"]["buzz"]["extra"]["channel_modes"] == {
+        CHANNEL: {"listen": "always", "replies": "hybrid"}
+    }
+    assert "channel_modes" not in persisted["platforms"]["buzz"]["extra"]
+    assert "channel_modes" not in persisted["gateway"]["buzz"]["extra"]
+    assert (
+        persisted["platforms"]["buzz"]["extra"]["top_level_setting"]
+        == "preserved"
+    )
+    assert persisted["gateway"]["buzz"]["extra"]["direct_setting"] == "preserved"
+    restarted = _restart_adapter(home, monkeypatch)
+    assert restarted.channel_policy_status(CHANNEL) == {
+        "applicable": True,
+        "listen": {"effective": "always", "source": "explicit"},
+        "replies": {"effective": "hybrid", "source": "explicit"},
+    }
+
+    reset_result = await runner._apply_plugin_channel_policy_action(
+        plugin_id="buzz-platform",
+        platform="buzz",
+        routed_profile="default",
+        channel_id=CHANNEL,
+        thread_id=None,
+        chat_type="group",
+        source_identity_candidates=(ADMIN_HEX, ADMIN_NPUB),
+        policy="listen",
+        value="reset",
+    )
+
+    assert reset_result["ok"] is True
+    persisted_after_reset = yaml.safe_load(config_path.read_text())
+    assert persisted_after_reset["gateway"]["platforms"]["buzz"]["extra"][
+        "channel_modes"
+    ] == {CHANNEL: {"replies": "hybrid"}}
+    restarted_after_reset = _restart_adapter(home, monkeypatch)
+    assert restarted_after_reset.channel_policy_status(CHANNEL) == {
+        "applicable": True,
+        "listen": {"effective": "mentions", "source": "inherited"},
+        "replies": {"effective": "hybrid", "source": "explicit"},
+    }
 
 
 @pytest.mark.asyncio
@@ -606,3 +1061,66 @@ async def test_concurrent_mutations_merge_without_lost_updates(tmp_path, monkeyp
         CHANNEL: {"listen": "always"},
         OTHER_CHANNEL: {"replies": "hybrid"},
     }
+
+
+@pytest.mark.asyncio
+async def test_same_property_operations_serialize_persistence_through_live_apply(
+    tmp_path, monkeypatch
+):
+    home = tmp_path / "default"
+    home.mkdir()
+    config_path = home / "config.yaml"
+    config_path.write_text(yaml.safe_dump(_raw_profile_config()))
+    adapter = _adapter()
+    adapter._running = True
+    runner = _runner_for_profiles(adapter)
+    monkeypatch.setattr("hermes_cli.profiles.get_profile_dir", lambda _name: home)
+    persist = runner._persist_plugin_channel_policy
+    first_persisted = threading.Event()
+    release_first = threading.Event()
+    persisted_values: list[str] = []
+
+    def pause_first_after_persistence(**kwargs):
+        result = persist(**kwargs)
+        persisted_values.append(kwargs["value"])
+        if kwargs["value"] == "always":
+            first_persisted.set()
+            if not release_first.wait(timeout=5):
+                raise TimeoutError("test did not release the first live apply")
+        return result
+
+    monkeypatch.setattr(
+        runner, "_persist_plugin_channel_policy", pause_first_after_persistence
+    )
+
+    async def mutate(value):
+        return await runner._apply_plugin_channel_policy_action(
+            plugin_id="buzz-platform",
+            platform="buzz",
+            routed_profile="default",
+            channel_id=CHANNEL,
+            thread_id=None,
+            chat_type="group",
+            source_identity_candidates=(ADMIN_HEX, ADMIN_NPUB),
+            policy="listen",
+            value=value,
+        )
+
+    first = asyncio.create_task(mutate("always"))
+    assert await asyncio.to_thread(first_persisted.wait, 5)
+    second = asyncio.create_task(mutate("mentions"))
+    try:
+        await asyncio.sleep(0.05)
+        assert persisted_values == ["always"]
+        assert not second.done()
+    finally:
+        release_first.set()
+    first_result, second_result = await asyncio.gather(first, second)
+
+    assert first_result["ok"] is second_result["ok"] is True
+    assert persisted_values == ["always", "mentions"]
+    persisted = yaml.safe_load(config_path.read_text())
+    assert persisted["gateway"]["platforms"]["buzz"]["extra"]["channel_modes"] == {
+        CHANNEL: {"listen": "mentions"}
+    }
+    assert adapter._channel_modes == {CHANNEL: {"listen": "mentions"}}

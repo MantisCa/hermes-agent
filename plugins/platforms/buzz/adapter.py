@@ -800,8 +800,16 @@ async def _handle_buzz_command(raw_args: str, invocation) -> str:
         result = await actions.set_channel_policy(selected, action)
     if not isinstance(result, dict) or result.get("ok") is not True:
         return _format_buzz_action_error(result if isinstance(result, dict) else {})
+    restart_required = (
+        action is not None
+        and result.get("persisted") is True
+        and result.get("live_applied") is False
+        and result.get("restart_required") is True
+    )
     status = result.get("status")
     if not isinstance(status, dict):
+        if restart_required:
+            return "Saved, but the live adapter could not be updated; restart required."
         return "Buzz channel policy action succeeded, but status is unavailable."
     text = _format_buzz_status(status, selected)
     if action is not None:
@@ -814,6 +822,8 @@ async def _handle_buzz_command(raw_args: str, invocation) -> str:
 
 class BuzzAdapter(BasePlatformAdapter):
     """Buzz adapter (WebSocket push with poll fallback) for the BasePlatformAdapter interface."""
+
+    supports_routed_profile_config_hydration = True
 
     def __init__(self, config, **kwargs):
         super().__init__(config=config, platform=Platform("buzz"))
@@ -843,6 +853,7 @@ class BuzzAdapter(BasePlatformAdapter):
         self._reply_to_mode: str = _reply_to_mode(config, extra)
         # Sparse, profile-scoped controls are fully validated before this adapter accepts events.
         self._channel_modes = _validate_channel_modes(extra.get("channel_modes"))
+        self._routed_channel_modes: Dict[str, Dict[str, Dict[str, str]]] = {}
         # Inbound transport: "auto" (WebSocket with poll fallback), "websocket" (required), "poll".
         _transport_raw = _scoped_platform_setting("BUZZ_TRANSPORT", extra, "transport")
         _transport = (_transport_raw or str(extra.get("transport", "auto") or "auto")).strip().lower()
@@ -909,13 +920,56 @@ class BuzzAdapter(BasePlatformAdapter):
                 candidates.append(npub)
         return tuple(candidates)
 
+    def enrich_source_reply_metadata(
+        self,
+        source: Any,
+        metadata: Optional[Dict[str, Any]],
+        *,
+        reply_to_message_id: Optional[str] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """Preserve the Buzz trigger and its placement for reply policy."""
+        chat_type = str(getattr(source, "chat_type", None) or "").strip().lower()
+        trigger = reply_to_message_id or getattr(source, "message_id", None)
+        if chat_type in {"", "dm", "direct", "private"} or not trigger:
+            return metadata
+        enriched = dict(metadata or {})
+        enriched["reply_to_message_id"] = str(trigger)
+        enriched["buzz_trigger_placement"] = (
+            "in_thread" if getattr(source, "thread_id", None) else "top_level"
+        )
+        return enriched
+
     @staticmethod
     def validate_channel_modes(raw: Any) -> Dict[str, Dict[str, str]]:
         """Validate a complete persisted mapping for the host mutation service."""
         return _validate_channel_modes(raw)
 
+    def hydrate_routed_profile_config(
+        self, profile_name: str, config: Any
+    ) -> None:
+        """Load routed policy before this shared transport accepts events."""
+        profile = str(profile_name or "").strip()
+        if not profile:
+            raise ValueError("routed profile name must be non-empty")
+        extra = getattr(config, "extra", None)
+        raw = extra.get("channel_modes") if isinstance(extra, dict) else None
+        self._routed_channel_modes[profile] = _validate_channel_modes(raw)
+
+    def _channel_modes_for_profile(
+        self, routed_profile: Optional[str]
+    ) -> Dict[str, Dict[str, str]]:
+        profile = str(routed_profile or "").strip()
+        if profile and profile in self._routed_channel_modes:
+            return self._routed_channel_modes[profile]
+        return self._channel_modes
+
     def apply_channel_policy(
-        self, channel_id: str, policy: str, value: Optional[str]
+        self,
+        channel_id: str,
+        policy: str,
+        value: Optional[str],
+        *,
+        routed_profile: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Apply one already-persisted policy in memory without performing I/O."""
         channel_id = _canonical_channel_id(channel_id)
@@ -928,7 +982,8 @@ class BuzzAdapter(BasePlatformAdapter):
             if value not in allowed:
                 raise ValueError(f"unsupported Buzz {policy} mode {value!r}")
 
-        updated = {cid: dict(modes) for cid, modes in self._channel_modes.items()}
+        current = self._channel_modes_for_profile(routed_profile)
+        updated = {cid: dict(modes) for cid, modes in current.items()}
         modes = updated.get(channel_id, {})
         if value is None:
             modes.pop(policy, None)
@@ -938,11 +993,23 @@ class BuzzAdapter(BasePlatformAdapter):
             updated[channel_id] = modes
         else:
             updated.pop(channel_id, None)
-        self._channel_modes = _validate_channel_modes(updated)
-        return self.channel_policy_status(channel_id)
+        validated = _validate_channel_modes(updated)
+        profile = str(routed_profile or "").strip()
+        if profile and profile in self._routed_channel_modes:
+            self._routed_channel_modes[profile] = validated
+        else:
+            self._channel_modes = validated
+        return self.channel_policy_status(
+            channel_id,
+            routed_profile=routed_profile,
+        )
 
     def channel_policy_status(
-        self, channel_id: str, *, chat_type: str = "group"
+        self,
+        channel_id: str,
+        *,
+        chat_type: str = "group",
+        routed_profile: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Return effective modes and whether each is inherited or explicit."""
         if str(chat_type or "").strip().lower() in {"", "dm", "direct", "private"}:
@@ -951,7 +1018,9 @@ class BuzzAdapter(BasePlatformAdapter):
                 "listen": {"effective": "always", "source": "direct-message"},
                 "replies": {
                     "effective": self.effective_reply_mode(
-                        channel_id, chat_type=chat_type
+                        channel_id,
+                        chat_type=chat_type,
+                        routed_profile=routed_profile,
                     ),
                     "source": "inherited",
                 },
@@ -960,44 +1029,57 @@ class BuzzAdapter(BasePlatformAdapter):
             canonical_id = str(uuid.UUID(str(channel_id).strip()))
         except (AttributeError, TypeError, ValueError):
             canonical_id = str(channel_id or "")
-        explicit = self._channel_modes.get(canonical_id, {})
+        explicit = self._channel_modes_for_profile(routed_profile).get(
+            canonical_id, {}
+        )
         return {
             "applicable": True,
             "listen": {
                 "effective": self.effective_listen_mode(
                     canonical_id,
                     chat_type=chat_type,
+                    routed_profile=routed_profile,
                 ),
                 "source": "explicit" if "listen" in explicit else "inherited",
             },
             "replies": {
                 "effective": self.effective_reply_mode(
-                    canonical_id, chat_type=chat_type
+                    canonical_id,
+                    chat_type=chat_type,
+                    routed_profile=routed_profile,
                 ),
                 "source": "explicit" if "replies" in explicit else "inherited",
             },
         }
 
     def effective_listen_mode(
-        self, channel_id: str, *, chat_type: str = "group"
+        self,
+        channel_id: str,
+        *,
+        chat_type: str = "group",
+        routed_profile: Optional[str] = None,
     ) -> str:
         """Return the effective channel activation mode."""
         return _resolve_effective_listen_mode(
-            self._channel_modes,
+            self._channel_modes_for_profile(routed_profile),
             channel_id,
             require_mention=self.require_mention,
             chat_type=chat_type,
         )
 
     def effective_reply_mode(
-        self, channel_id: str, *, chat_type: Optional[str] = None
+        self,
+        channel_id: str,
+        *,
+        chat_type: Optional[str] = None,
+        routed_profile: Optional[str] = None,
     ) -> str:
         """Return the effective outbound placement mode for one conversation."""
         if chat_type is None:
             state = getattr(self, "_channel_state", {}).get(str(channel_id), {})
             chat_type = state.get("chat_type", "group")
         return _resolve_effective_reply_mode(
-            self._channel_modes,
+            self._channel_modes_for_profile(routed_profile),
             channel_id,
             reply_to_mode=self._reply_to_mode,
             chat_type=chat_type,
@@ -1949,9 +2031,23 @@ class BuzzAdapter(BasePlatformAdapter):
             or reply_to_is_own
             or _is_exact_buzz_command(content)
         )
+        # Resolve the routed runtime before the listen gate. A shared primary
+        # transport can carry policy hydrated from a secondary profile, and an
+        # ambient ``always`` event must not be dropped using the primary
+        # profile's inherited ``mentions`` mode during restart startup.
+        thread_id = self._extract_thread_root(event)
+        source = self.build_source(
+            chat_id=channel_id,
+            chat_name=self._channel_names.get(channel_id, channel_id),
+            chat_type="dm" if is_dm else "group",
+            user_id=pubkey,
+            thread_id=thread_id,
+            message_id=event_id,
+        )
         listen_mode = self.effective_listen_mode(
             channel_id,
             chat_type="dm" if is_dm else "group",
+            routed_profile=getattr(source, "profile", None),
         )
         # Channels dispatch when addressed (@mention, p-tag, reply to us, or /buzz); ``always``
         # additionally admits authorized ambient messages. DMs always dispatch.
@@ -1980,8 +2076,8 @@ class BuzzAdapter(BasePlatformAdapter):
         # open with "@Chip" even though no mention is required there, so the
         # strip applies to both chat types.
         dispatch_text = self._strip_mention(content)
-        # NIP-10 root scopes the session; remember it so our reply joins the SAME thread instead of nesting.
-        thread_id = self._extract_thread_root(event)
+        # Remember where this message sits in the thread graph so our reply
+        # can join the SAME thread rather than nesting a new one under it.
         self._record_thread_root(event_id, event)
         # Attachment fetch/cache is a security-sensitive side effect. Only the
         # gateway's authoritative callback can permit it, and only an explicit
@@ -2007,13 +2103,27 @@ class BuzzAdapter(BasePlatformAdapter):
             # Mixed kinds use document semantics so an audio member is not mistaken for a voice note (STT).
             kinds = {attachment.kind for attachment in attachments}
             message_type = _ATTACHMENT_KIND_TYPES.get(next(iter(kinds)), MessageType.DOCUMENT) if len(kinds) == 1 else MessageType.DOCUMENT
+
+        user_name = await self._resolve_user_name(pubkey)
+        source.user_name = user_name
         await self._dispatch_message(
-            text=dispatch_text, chat_id=channel_id, chat_type=chat_type, user_id=pubkey,
-            user_name=await self._resolve_user_name(pubkey), message_id=event_id,
-            created_at=created_at, thread_id=thread_id, reply_to_message_id=reply_parent_id,
-            reply_to_text=reply_meta[1] if reply_meta else None, reply_to_author_id=reply_meta[0] if reply_meta else None,
-            reply_to_is_own_message=reply_to_is_own, media_urls=[attachment.path for attachment in attachments],
-            media_types=[attachment.media_type for attachment in attachments], message_type=message_type, raw_message=event,
+            text=dispatch_text,
+            chat_id=channel_id,
+            chat_type=chat_type,
+            user_id=pubkey,
+            user_name=user_name,
+            message_id=event_id,
+            created_at=created_at,
+            thread_id=thread_id,
+            reply_to_message_id=reply_parent_id,
+            reply_to_text=reply_meta[1] if reply_meta else None,
+            reply_to_author_id=reply_meta[0] if reply_meta else None,
+            reply_to_is_own_message=reply_to_is_own,
+            media_urls=[attachment.path for attachment in attachments],
+            media_types=[attachment.media_type for attachment in attachments],
+            message_type=message_type,
+            raw_message=event,
+            source=source,
         )
 
     # ── DM classification: DMs leak in via ``channels list`` as "group"; a real channel's p-tag is only addressing ──
@@ -2161,11 +2271,15 @@ class BuzzAdapter(BasePlatformAdapter):
         Hybrid sends fail flat when provenance is missing, except that an
         explicit ``metadata.thread_id`` is a supported synthetic thread target.
         """
-        mode = self.effective_reply_mode(str(chat_id))
+        meta = metadata if isinstance(metadata, dict) else {}
+        routed_profile = str(meta.get("hermes_profile") or "").strip() or None
+        mode = self.effective_reply_mode(
+            str(chat_id),
+            routed_profile=routed_profile,
+        )
         if mode == "flat":
             return None
 
-        meta = metadata if isinstance(metadata, dict) else {}
         placement = str(meta.get("buzz_trigger_placement") or "").strip().lower()
         if placement not in {"top_level", "in_thread"}:
             placement = ""
@@ -2287,7 +2401,9 @@ class BuzzAdapter(BasePlatformAdapter):
         reply_to_message_id: Optional[str] = None, reply_to_text: Optional[str] = None,
         reply_to_author_id: Optional[str] = None, reply_to_is_own_message: bool = False,
         media_urls: Optional[List[str]] = None, media_types: Optional[List[str]] = None,
-        message_type: MessageType = MessageType.TEXT, raw_message: Any = None,
+        message_type: MessageType = MessageType.TEXT,
+        raw_message: Any = None,
+        source: Optional[Any] = None,
     ) -> None:
         """Build a MessageEvent and hand it to the base class handler."""
         if not self._message_handler:
@@ -2306,10 +2422,11 @@ class BuzzAdapter(BasePlatformAdapter):
         elif localized_urls and localized_type not in (message_type, MessageType.TEXT):
             # Mixed sources use document semantics so audio isn't routed to STT.
             message_type = MessageType.DOCUMENT
-        source = self.build_source(
-            chat_id=chat_id, chat_name=self._channel_names.get(chat_id, chat_id), chat_type=chat_type,
-            user_id=user_id, user_name=user_name, thread_id=thread_id, message_id=message_id,
-        )
+        if source is None:
+            source = self.build_source(
+                chat_id=chat_id, chat_name=self._channel_names.get(chat_id, chat_id), chat_type=chat_type,
+                user_id=user_id, user_name=user_name, thread_id=thread_id, message_id=message_id,
+            )
         event = MessageEvent(
             text=text, message_type=message_type, source=source, raw_message=raw_message, message_id=message_id,
             media_urls=list(media_urls), media_types=list(media_types), media_text_inlined=[False] * len(media_urls),

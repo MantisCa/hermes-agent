@@ -368,6 +368,7 @@ class TestSourceBoundChannelPolicy:
             plugin_id="p",
             platform="telegram",
             routed_profile="default",
+            transport_profile="default",
             channel_id="channel-1",
             thread_id="thread-1",
             chat_type="group",
@@ -433,6 +434,7 @@ class TestSourceBoundChannelPolicy:
             chat_type="group",
             routed_profile="team-b",
             source_identity_candidates=("ordinary",),
+            transport_profile="default",
         )
 
         with _grant(True), patch("gateway.run._gateway_runner_ref", lambda: runner):
@@ -443,6 +445,7 @@ class TestSourceBoundChannelPolicy:
             plugin_id="p",
             platform="telegram",
             routed_profile="team-b",
+            transport_profile="default",
             channel_id="channel-1",
             thread_id=None,
             chat_type="group",

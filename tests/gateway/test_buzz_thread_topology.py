@@ -314,13 +314,13 @@ class TestReplyThreadingConfig:
 
 class TestProgressRouting:
 
-    def test_buzz_progress_threads_by_default(self):
+    def test_adapter_owned_progress_does_not_get_a_core_synthetic_thread(self):
         from gateway.run import _resolve_progress_thread_id
 
         assert _resolve_progress_thread_id(
             "buzz", source_thread_id=None, event_message_id="evt-1",
             reply_in_thread=True,
-        ) == "evt-1"
+        ) is None
 
     def test_buzz_progress_flat_when_opted_out(self):
         from gateway.run import _resolve_progress_thread_id
@@ -410,7 +410,16 @@ async def test_gateway_buzz_metadata_keeps_trigger_and_placement_for_progress(
     from gateway.config import Platform
     from gateway.run import GatewayRunner
 
+    adapter = _make_adapter(
+        extra={
+            "reply_in_thread": False,
+            "channel_modes": {CHANNEL: {"replies": mode}},
+        }
+    )
     runner = object.__new__(GatewayRunner)
+    runner.adapters = {Platform.BUZZ: adapter}
+    runner._profile_adapters = {}
+    runner._primary_profile_name = "default"
     top_source = SimpleNamespace(
         platform=Platform.BUZZ,
         chat_id=CHANNEL,
@@ -440,17 +449,49 @@ async def test_gateway_buzz_metadata_keeps_trigger_and_placement_for_progress(
         "buzz_trigger_placement": "in_thread",
     }
 
-    adapter = _make_adapter(
-        extra={
-            "reply_in_thread": False,
-            "channel_modes": {CHANNEL: {"replies": mode}},
-        }
-    )
     cli = _CapturingCli()
     adapter._run_cli = cli
     await adapter.send(CHANNEL, "top progress", metadata=top_meta)
     await adapter.send(CHANNEL, "thread progress", metadata=thread_meta)
     assert [_reply_arg(args) for args, _ in cli.calls] == expected
+
+
+@pytest.mark.asyncio
+async def test_base_final_response_threads_top_level_buzz_attachment(tmp_path):
+    """The real Base final-response path gives Buzz files trigger metadata."""
+    from gateway.platforms.base import MessageEvent, MessageType
+    from gateway.session import build_session_key
+
+    attachment = tmp_path / "report.pdf"
+    attachment.write_bytes(b"report")
+    adapter = _make_adapter(
+        extra={"channel_modes": {CHANNEL: {"replies": "threaded"}}},
+        typing_indicator=False,
+    )
+    cli = _CapturingCli()
+    adapter._run_cli = cli
+
+    async def handler(_event):
+        return f"MEDIA:{attachment}"
+
+    adapter.set_message_handler(handler)
+    source = adapter.build_source(
+        chat_id=CHANNEL,
+        chat_type="group",
+        user_id=OTHER_PUBKEY,
+        message_id="top-trigger",
+    )
+    event = MessageEvent(
+        text="make a report",
+        message_type=MessageType.TEXT,
+        source=source,
+        message_id="top-trigger",
+    )
+
+    await adapter._process_message_background(event, build_session_key(source))
+
+    attachment_args = next(args for args, _ in cli.calls if "--file" in args)
+    assert _reply_arg(attachment_args) == "top-trigger"
 
 
 @pytest.mark.asyncio

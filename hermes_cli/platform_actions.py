@@ -92,6 +92,7 @@ class PlatformActions:
         chat_type: str,
         routed_profile: str,
         source_identity_candidates: Tuple[str, ...],
+        transport_profile: Optional[str] = None,
     ) -> "SourceBoundPlatformActions":
         """Bind the mutation-only facade to one immutable gateway source."""
         return SourceBoundPlatformActions(
@@ -107,6 +108,11 @@ class PlatformActions:
                     for value in source_identity_candidates
                     if str(value).strip()
                 )
+            ),
+            transport_profile=(
+                str(transport_profile).strip()
+                if transport_profile is not None
+                else None
             ),
         )
 
@@ -243,6 +249,10 @@ class SourceBoundPlatformActions:
     chat_type: str
     routed_profile: str
     source_identity_candidates: Tuple[str, ...]
+    # Opaque host-owned adapter-registry identity. It distinguishes a routed
+    # runtime profile from the profile whose live transport received the
+    # source without exposing an adapter, SDK client, credential, or path.
+    transport_profile: Optional[str] = None
 
     def _validated_host(
         self, *, mutation: bool
@@ -250,10 +260,11 @@ class SourceBoundPlatformActions:
         Optional[Any],
         Optional[str],
         Optional[str],
+        Optional[str],
         Optional[Dict[str, Any]],
     ]:
         if not self.owner._capability_granted():
-            return None, None, None, _err(
+            return None, None, None, None, _err(
                 "capability_not_granted",
                 f"plugin {self.owner._plugin_id!r} lacks {CAPABILITY_ID!r}",
             )
@@ -264,7 +275,7 @@ class SourceBoundPlatformActions:
         }
         for name, raw in required.items():
             if not isinstance(raw, str) or not raw.strip():
-                return None, None, None, _err(
+                return None, None, None, None, _err(
                     "invalid_argument", f"{name} must be a non-empty string"
                 )
         try:
@@ -272,7 +283,7 @@ class SourceBoundPlatformActions:
 
             platform = Platform(self.platform.strip().lower()).value
         except Exception:
-            return None, None, None, _err(
+            return None, None, None, None, _err(
                 "unknown_platform", f"unknown platform {self.platform!r}"
             )
         try:
@@ -280,16 +291,20 @@ class SourceBoundPlatformActions:
 
             profile = normalize_profile_name(self.routed_profile)
             validate_profile_name(profile)
+            transport_profile = normalize_profile_name(
+                self.transport_profile or self.routed_profile
+            )
+            validate_profile_name(transport_profile)
         except Exception:
-            return None, None, None, _err(
-                "invalid_argument", "routed_profile is invalid"
+            return None, None, None, None, _err(
+                "invalid_argument", "routed or transport profile is invalid"
             )
         if mutation and self.chat_type.strip().lower() in {"", "dm", "direct", "private"}:
-            return None, None, None, _err(
+            return None, None, None, None, _err(
                 "unsupported_context", "channel policies require a group or channel source"
             )
         if mutation and not self.source_identity_candidates:
-            return None, None, None, _err(
+            return None, None, None, None, _err(
                 "explicit_admin_required", "no normalized sender identity is available"
             )
         try:
@@ -299,19 +314,26 @@ class SourceBoundPlatformActions:
         except Exception:
             runner = None
         if runner is None:
-            return None, None, None, _err(
+            return None, None, None, None, _err(
                 "gateway_unavailable", "no gateway runner is active in this process"
             )
-        return runner, platform, profile, None
+        return runner, platform, profile, transport_profile, None
 
     async def get_channel_policy_status(self) -> Dict[str, Any]:
         """Read current source-bound policy state without granting mutation access."""
-        runner, platform, profile, error = self._validated_host(mutation=False)
+        runner, platform, profile, transport_profile, error = self._validated_host(
+            mutation=False
+        )
         if error is not None:
             result = error
             self.owner._audit("get_channel_policy_status", self.platform, result)
             return result
-        assert runner is not None and platform is not None and profile is not None
+        assert (
+            runner is not None
+            and platform is not None
+            and profile is not None
+            and transport_profile is not None
+        )
         service = getattr(runner, "_get_plugin_channel_policy_status_action", None)
         if not callable(service):
             result = _err(
@@ -324,6 +346,7 @@ class SourceBoundPlatformActions:
                 plugin_id=self.owner._plugin_id,
                 platform=platform,
                 routed_profile=profile,
+                transport_profile=transport_profile,
                 channel_id=self.channel_id,
                 thread_id=self.thread_id,
                 chat_type=self.chat_type,
@@ -340,7 +363,9 @@ class SourceBoundPlatformActions:
 
     async def set_channel_policy(self, policy: str, value: str) -> Dict[str, Any]:
         """Request a host-owned channel policy mutation after independent gates."""
-        runner, platform, profile, error = self._validated_host(mutation=True)
+        runner, platform, profile, transport_profile, error = self._validated_host(
+            mutation=True
+        )
         if error is not None:
             result = error
             self.owner._audit("set_channel_policy", self.platform, result)
@@ -350,7 +375,12 @@ class SourceBoundPlatformActions:
                 result = _err("invalid_argument", f"{name} must be a non-empty string")
                 self.owner._audit("set_channel_policy", self.platform, result)
                 return result
-        assert runner is not None and platform is not None and profile is not None
+        assert (
+            runner is not None
+            and platform is not None
+            and profile is not None
+            and transport_profile is not None
+        )
         service = getattr(runner, "_apply_plugin_channel_policy_action", None)
         if not callable(service):
             result = _err("unsupported_platform_action", "the gateway has no channel policy service")
@@ -361,6 +391,7 @@ class SourceBoundPlatformActions:
                 plugin_id=self.owner._plugin_id,
                 platform=platform,
                 routed_profile=profile,
+                transport_profile=transport_profile,
                 channel_id=self.channel_id,
                 thread_id=self.thread_id,
                 chat_type=self.chat_type,
