@@ -266,7 +266,7 @@ class TestReplyThreadingConfig:
     async def test_standalone_send_honors_opt_out(self, monkeypatch, tmp_path):
         """Out-of-process cron delivery must not thread when opted out."""
         fake_cli = tmp_path / "buzz"
-        fake_cli.write_text("#!/bin/sh\n")
+        fake_cli.write_text("#!/bin/sh\n", encoding="utf-8")
         fake_cli.chmod(0o755)
         monkeypatch.setenv("BUZZ_REPLY_IN_THREAD", "false")
 
@@ -289,7 +289,7 @@ class TestReplyThreadingConfig:
     @pytest.mark.asyncio
     async def test_standalone_send_threads_by_default(self, monkeypatch, tmp_path):
         fake_cli = tmp_path / "buzz"
-        fake_cli.write_text("#!/bin/sh\n")
+        fake_cli.write_text("#!/bin/sh\n", encoding="utf-8")
         fake_cli.chmod(0o755)
         captured = {}
 
@@ -578,7 +578,7 @@ async def test_standalone_send_reads_persisted_channel_mode_and_global_alias(
     monkeypatch, tmp_path, channel_mode, global_alias, expected
 ):
     fake_cli = tmp_path / "buzz"
-    fake_cli.write_text("#!/bin/sh\n")
+    fake_cli.write_text("#!/bin/sh\n", encoding="utf-8")
     fake_cli.chmod(0o755)
     captured = {}
 

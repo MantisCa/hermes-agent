@@ -365,7 +365,7 @@ async def test_real_status_service_returns_effective_buzz_policy(tmp_path, monke
     raw["gateway"]["platforms"]["buzz"]["extra"]["channel_modes"] = {
         CHANNEL: {"listen": "always", "replies": "hybrid"}
     }
-    (home / "config.yaml").write_text(yaml.safe_dump(raw))
+    (home / "config.yaml").write_text(yaml.safe_dump(raw), encoding="utf-8")
     adapter = _adapter(
         extra={"channel_modes": raw["gateway"]["platforms"]["buzz"]["extra"]["channel_modes"]}
     )
@@ -401,10 +401,10 @@ async def test_real_status_service_denies_routed_profile_without_capability(
     team_home = tmp_path / "profiles" / "team-b"
     default_home.mkdir()
     team_home.mkdir(parents=True)
-    (default_home / "config.yaml").write_text(yaml.safe_dump(_raw_profile_config()))
+    (default_home / "config.yaml").write_text(yaml.safe_dump(_raw_profile_config()), encoding="utf-8")
     team_raw = _raw_profile_config()
     team_raw["plugins"]["entries"]["buzz-platform"]["granted_capabilities"] = []
-    (team_home / "config.yaml").write_text(yaml.safe_dump(team_raw))
+    (team_home / "config.yaml").write_text(yaml.safe_dump(team_raw), encoding="utf-8")
     default_adapter = _adapter()
     team_adapter = _adapter()
     default_adapter._running = team_adapter._running = True
@@ -439,11 +439,11 @@ async def test_shared_primary_transport_uses_routed_authority_and_live_policy(
     team_home = tmp_path / "profiles" / "team-b"
     default_home.mkdir()
     team_home.mkdir(parents=True)
-    (default_home / "config.yaml").write_text(yaml.safe_dump(_raw_profile_config()))
+    (default_home / "config.yaml").write_text(yaml.safe_dump(_raw_profile_config()), encoding="utf-8")
     team_modes = {CHANNEL: {"listen": "always"}}
     team_raw = _raw_profile_config()
     team_raw["gateway"]["platforms"]["buzz"]["extra"]["channel_modes"] = team_modes
-    (team_home / "config.yaml").write_text(yaml.safe_dump(team_raw))
+    (team_home / "config.yaml").write_text(yaml.safe_dump(team_raw), encoding="utf-8")
 
     transport_adapter = _adapter()
     transport_adapter._running = True
@@ -515,7 +515,7 @@ async def test_shared_primary_transport_uses_routed_authority_and_live_policy(
     }
     assert changed["ok"] is True
     assert changed["live_applied"] is True
-    persisted = yaml.safe_load((team_home / "config.yaml").read_text())
+    persisted = yaml.safe_load((team_home / "config.yaml").read_text(encoding="utf-8"))
     assert persisted["gateway"]["platforms"]["buzz"]["extra"]["channel_modes"] == {
         CHANNEL: {"listen": "always", "replies": "hybrid"}
     }
@@ -545,13 +545,13 @@ async def test_shared_transport_restart_hydrates_routed_policy_before_intake(
     team_home = tmp_path / "profiles" / "team-b"
     default_home.mkdir()
     team_home.mkdir(parents=True)
-    (default_home / "config.yaml").write_text(yaml.safe_dump(_raw_profile_config()))
+    (default_home / "config.yaml").write_text(yaml.safe_dump(_raw_profile_config()), encoding="utf-8")
     team_raw = _raw_profile_config()
     team_raw["gateway"]["platforms"]["buzz"]["enabled"] = True
     team_raw["gateway"]["platforms"]["buzz"]["extra"]["channel_modes"] = {
         CHANNEL: {"listen": "always"}
     }
-    (team_home / "config.yaml").write_text(yaml.safe_dump(team_raw))
+    (team_home / "config.yaml").write_text(yaml.safe_dump(team_raw), encoding="utf-8")
 
     restarted_transport = _adapter()
     runner = _runner_for_profiles(restarted_transport)
@@ -630,8 +630,8 @@ async def test_mutation_persists_sparse_routed_profile_then_updates_live_adapter
     team_home.mkdir(parents=True)
     default_config = _raw_profile_config()
     team_config = _raw_profile_config()
-    (default_home / "config.yaml").write_text(yaml.safe_dump(default_config))
-    (team_home / "config.yaml").write_text(yaml.safe_dump(team_config))
+    (default_home / "config.yaml").write_text(yaml.safe_dump(default_config), encoding="utf-8")
+    (team_home / "config.yaml").write_text(yaml.safe_dump(team_config), encoding="utf-8")
     default_before = (default_home / "config.yaml").read_bytes()
 
     default_adapter = _adapter()
@@ -660,7 +660,7 @@ async def test_mutation_persists_sparse_routed_profile_then_updates_live_adapter
 
     assert result["ok"] is True
     assert result["live_applied"] is True
-    persisted = yaml.safe_load((team_home / "config.yaml").read_text())
+    persisted = yaml.safe_load((team_home / "config.yaml").read_text(encoding="utf-8"))
     assert persisted["gateway"]["platforms"]["buzz"]["extra"]["channel_modes"] == {
         CHANNEL: {"listen": "always"}
     }
@@ -688,7 +688,7 @@ async def test_top_level_platform_modes_migrate_on_set_and_stay_reset_after_rest
         }
     }
     config_path = home / "config.yaml"
-    config_path.write_text(yaml.safe_dump(raw))
+    config_path.write_text(yaml.safe_dump(raw), encoding="utf-8")
     adapter = _adapter(extra={"channel_modes": top_modes})
     adapter._running = True
     runner = _runner_for_profiles(adapter)
@@ -707,7 +707,7 @@ async def test_top_level_platform_modes_migrate_on_set_and_stay_reset_after_rest
     )
 
     assert set_result["ok"] is True
-    persisted = yaml.safe_load(config_path.read_text())
+    persisted = yaml.safe_load(config_path.read_text(encoding="utf-8"))
     assert persisted["gateway"]["platforms"]["buzz"]["extra"]["channel_modes"] == {
         CHANNEL: {"listen": "always", "replies": "hybrid"}
     }
@@ -769,7 +769,7 @@ async def test_duplicate_mode_nodes_migrate_to_canonical_and_reset_without_shado
         }
     }
     config_path = home / "config.yaml"
-    config_path.write_text(yaml.safe_dump(raw))
+    config_path.write_text(yaml.safe_dump(raw), encoding="utf-8")
     adapter = _adapter(extra={"channel_modes": {CHANNEL: {"listen": "always"}}})
     adapter._running = True
     runner = _runner_for_profiles(adapter)
@@ -788,7 +788,7 @@ async def test_duplicate_mode_nodes_migrate_to_canonical_and_reset_without_shado
     )
 
     assert set_result["ok"] is True
-    persisted = yaml.safe_load(config_path.read_text())
+    persisted = yaml.safe_load(config_path.read_text(encoding="utf-8"))
     assert persisted["gateway"]["platforms"]["buzz"]["extra"]["channel_modes"] == {
         CHANNEL: {"listen": "always", "replies": "hybrid"}
     }
@@ -819,7 +819,7 @@ async def test_duplicate_mode_nodes_migrate_to_canonical_and_reset_without_shado
     )
 
     assert reset_result["ok"] is True
-    persisted_after_reset = yaml.safe_load(config_path.read_text())
+    persisted_after_reset = yaml.safe_load(config_path.read_text(encoding="utf-8"))
     assert persisted_after_reset["gateway"]["platforms"]["buzz"]["extra"][
         "channel_modes"
     ] == {CHANNEL: {"replies": "hybrid"}}
@@ -836,7 +836,7 @@ async def test_non_admin_or_write_failure_never_changes_live_state(tmp_path, mon
     home = tmp_path / "default"
     home.mkdir()
     config_path = home / "config.yaml"
-    config_path.write_text(yaml.safe_dump(_raw_profile_config()))
+    config_path.write_text(yaml.safe_dump(_raw_profile_config()), encoding="utf-8")
     adapter = _adapter()
     adapter._running = True
     runner = _runner_for_profiles(adapter)
@@ -884,7 +884,7 @@ async def test_host_rejects_dm_scope_before_persistence(tmp_path, monkeypatch):
     home = tmp_path / "default"
     home.mkdir()
     config_path = home / "config.yaml"
-    config_path.write_text(yaml.safe_dump(_raw_profile_config()))
+    config_path.write_text(yaml.safe_dump(_raw_profile_config()), encoding="utf-8")
     before = config_path.read_bytes()
     adapter = _adapter()
     adapter._running = True
@@ -913,7 +913,7 @@ async def test_host_rejects_dm_scope_before_persistence(tmp_path, monkeypatch):
 async def test_active_custom_profile_writes_current_hermes_home(tmp_path, monkeypatch):
     custom_home = tmp_path / "custom-home"
     custom_home.mkdir()
-    (custom_home / "config.yaml").write_text(yaml.safe_dump(_raw_profile_config()))
+    (custom_home / "config.yaml").write_text(yaml.safe_dump(_raw_profile_config()), encoding="utf-8")
     adapter = _adapter()
     adapter._running = True
     runner = _runner_for_profiles(adapter)
@@ -938,7 +938,7 @@ async def test_active_custom_profile_writes_current_hermes_home(tmp_path, monkey
     )
 
     assert result["ok"] is True
-    persisted = yaml.safe_load((custom_home / "config.yaml").read_text())
+    persisted = yaml.safe_load((custom_home / "config.yaml").read_text(encoding="utf-8"))
     assert persisted["gateway"]["platforms"]["buzz"]["extra"]["channel_modes"] == {
         CHANNEL: {"replies": "hybrid"}
     }
@@ -954,7 +954,7 @@ async def test_reset_prunes_only_selected_property_and_empty_channel(tmp_path, m
         CHANNEL: {"listen": "always", "replies": "hybrid"},
         OTHER_CHANNEL: {"listen": "mentions"},
     }
-    (home / "config.yaml").write_text(yaml.safe_dump(raw))
+    (home / "config.yaml").write_text(yaml.safe_dump(raw), encoding="utf-8")
     adapter = _adapter(extra={"channel_modes": raw["gateway"]["platforms"]["buzz"]["extra"]["channel_modes"]})
     adapter._running = True
     runner = _runner_for_profiles(adapter)
@@ -974,7 +974,7 @@ async def test_reset_prunes_only_selected_property_and_empty_channel(tmp_path, m
     )
 
     assert first["ok"] is second["ok"] is True
-    persisted = yaml.safe_load((home / "config.yaml").read_text())
+    persisted = yaml.safe_load((home / "config.yaml").read_text(encoding="utf-8"))
     assert persisted["gateway"]["platforms"]["buzz"]["extra"]["channel_modes"] == {
         OTHER_CHANNEL: {"listen": "mentions"}
     }
@@ -985,7 +985,7 @@ async def test_reset_prunes_only_selected_property_and_empty_channel(tmp_path, m
 async def test_adapter_replacement_after_persist_receives_live_update(tmp_path, monkeypatch):
     home = tmp_path / "default"
     home.mkdir()
-    (home / "config.yaml").write_text(yaml.safe_dump(_raw_profile_config()))
+    (home / "config.yaml").write_text(yaml.safe_dump(_raw_profile_config()), encoding="utf-8")
     original_adapter = _adapter()
     replacement_adapter = _adapter()
     original_adapter._running = replacement_adapter._running = True
@@ -1016,7 +1016,7 @@ async def test_adapter_replacement_after_persist_receives_live_update(tmp_path, 
 async def test_live_setter_failure_reports_persisted_restart_required(tmp_path, monkeypatch):
     home = tmp_path / "default"
     home.mkdir()
-    (home / "config.yaml").write_text(yaml.safe_dump(_raw_profile_config()))
+    (home / "config.yaml").write_text(yaml.safe_dump(_raw_profile_config()), encoding="utf-8")
     adapter = _adapter()
     adapter._running = True
     runner = _runner_for_profiles(adapter)
@@ -1038,7 +1038,7 @@ async def test_live_setter_failure_reports_persisted_restart_required(tmp_path, 
     assert result["persisted"] is True
     assert result["live_applied"] is False
     assert result["restart_required"] is True
-    persisted = yaml.safe_load((home / "config.yaml").read_text())
+    persisted = yaml.safe_load((home / "config.yaml").read_text(encoding="utf-8"))
     assert persisted["gateway"]["platforms"]["buzz"]["extra"]["channel_modes"] == {
         CHANNEL: {"listen": "always"}
     }
@@ -1055,7 +1055,7 @@ async def test_reasserting_canonical_policy_skips_write_but_repairs_live_state(
         CHANNEL: {"listen": "always"}
     }
     config_path = home / "config.yaml"
-    config_path.write_text(yaml.safe_dump(raw))
+    config_path.write_text(yaml.safe_dump(raw), encoding="utf-8")
     before = config_path.read_bytes()
     adapter = _adapter()
     adapter._running = True
@@ -1090,7 +1090,7 @@ async def test_routed_capability_recheck_reports_capability_error(tmp_path, monk
     raw = _raw_profile_config()
     raw["plugins"]["entries"]["buzz-platform"]["granted_capabilities"] = []
     config_path = home / "config.yaml"
-    config_path.write_text(yaml.safe_dump(raw))
+    config_path.write_text(yaml.safe_dump(raw), encoding="utf-8")
     before = config_path.read_bytes()
     adapter = _adapter()
     adapter._running = True
@@ -1114,7 +1114,7 @@ async def test_routed_capability_recheck_reports_capability_error(tmp_path, monk
 async def test_concurrent_mutations_merge_without_lost_updates(tmp_path, monkeypatch):
     home = tmp_path / "default"
     home.mkdir()
-    (home / "config.yaml").write_text(yaml.safe_dump(_raw_profile_config()))
+    (home / "config.yaml").write_text(yaml.safe_dump(_raw_profile_config()), encoding="utf-8")
     adapter = _adapter()
     adapter._running = True
     runner = _runner_for_profiles(adapter)
@@ -1134,7 +1134,7 @@ async def test_concurrent_mutations_merge_without_lost_updates(tmp_path, monkeyp
     )
 
     assert listen["ok"] is replies["ok"] is True
-    persisted = yaml.safe_load((home / "config.yaml").read_text())
+    persisted = yaml.safe_load((home / "config.yaml").read_text(encoding="utf-8"))
     assert persisted["gateway"]["platforms"]["buzz"]["extra"]["channel_modes"] == {
         CHANNEL: {"listen": "always"},
         OTHER_CHANNEL: {"replies": "hybrid"},
@@ -1152,7 +1152,7 @@ async def test_same_property_operations_serialize_persistence_through_live_apply
     home = tmp_path / "default"
     home.mkdir()
     config_path = home / "config.yaml"
-    config_path.write_text(yaml.safe_dump(_raw_profile_config()))
+    config_path.write_text(yaml.safe_dump(_raw_profile_config()), encoding="utf-8")
     adapter = _adapter()
     adapter._running = True
     runner = _runner_for_profiles(adapter)
@@ -1201,7 +1201,7 @@ async def test_same_property_operations_serialize_persistence_through_live_apply
 
     assert first_result["ok"] is second_result["ok"] is True
     assert persisted_values == ["always", "mentions"]
-    persisted = yaml.safe_load(config_path.read_text())
+    persisted = yaml.safe_load(config_path.read_text(encoding="utf-8"))
     assert persisted["gateway"]["platforms"]["buzz"]["extra"]["channel_modes"] == {
         CHANNEL: {"listen": "mentions"}
     }
