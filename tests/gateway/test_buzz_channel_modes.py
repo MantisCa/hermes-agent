@@ -296,7 +296,7 @@ async def test_exact_buzz_token_bypasses_mentions_but_embedded_prose_does_not():
     adapter._running = True
     adapter._self_pubkey = "b" * 64
     adapter._self_npub = _buzz.hex_to_npub(adapter._self_pubkey) or ""
-    adapter._display_name = "Gaal"
+    adapter._display_name = "Hermes"
     adapter.set_authorization_check(lambda *_args: True)
     handler = AsyncMock(return_value=None)
     adapter.set_message_handler(handler)
@@ -589,7 +589,7 @@ async def test_shared_transport_restart_hydrates_routed_policy_before_intake(
     restarted_transport.set_authorization_check(lambda *_args: True)
     restarted_transport._self_pubkey = "b" * 64
     restarted_transport._self_npub = _buzz.hex_to_npub("b" * 64) or ""
-    restarted_transport._display_name = "Gaal"
+    restarted_transport._display_name = "Hermes"
     monkeypatch.setattr(
         restarted_transport,
         "_resolve_user_name",
