@@ -903,37 +903,6 @@ class GatewayBusySessionMixin:
                     merged[key] = block[key]
         return merged
 
-    @staticmethod
-    def _plugin_channel_modes_node(
-        raw: dict, platform: str,
-    ) -> tuple[dict, dict, tuple[dict, ...]]:
-        """Return canonical ``extra``, effective modes, and higher-precedence nodes."""
-        node = raw
-        for segment in ("gateway", "platforms", platform, "extra"):
-            child = node.get(segment)
-            if child is None:
-                child = {}
-                node[segment] = child
-            if not isinstance(child, dict):
-                raise ValueError(
-                    f"cannot write gateway.platforms.{platform}.extra: "
-                    f"{segment!r} is not a mapping"
-                )
-            node = child
-        modes = node.get("channel_modes", {})
-        shadowing_nodes: list[dict] = []
-        gateway = raw.get("gateway") if isinstance(raw, dict) else None
-        top_platforms = raw.get("platforms") if isinstance(raw, dict) else None
-        for parent in (top_platforms, gateway):
-            block = parent.get(platform) if isinstance(parent, dict) else None
-            extra = block.get("extra") if isinstance(block, dict) else None
-            if isinstance(extra, dict) and extra is not node and "channel_modes" in extra:
-                modes = extra.get("channel_modes")
-                shadowing_nodes.append(extra)
-        if modes is None:
-            modes = {}
-        return node, modes, tuple(shadowing_nodes)
-
     def _plugin_channel_policy_operation_lock(
         self, routed_profile: str, platform: str,
     ) -> asyncio.Lock:
@@ -1020,9 +989,11 @@ class GatewayBusySessionMixin:
         policy: str,
         value: str,
         source_identity_candidates: tuple[str, ...],
-        validator: Callable[[Any], dict],
+        config_updater: Callable[
+            [dict, str, str, str], tuple[str, Optional[str], bool]
+        ],
     ) -> tuple[str, Optional[str]]:
-        """Perform the complete locked, sparse profile config transaction."""
+        """Authorize and atomically persist an adapter-owned config mutation."""
         from gateway.slash_access import policy_from_extra
         from hermes_cli import config as config_mod
         from hermes_cli.plugins import _locked_plugin_state
@@ -1044,49 +1015,19 @@ class GatewayBusySessionMixin:
                         "an explicitly configured group administrator is required"
                     )
 
-                extra, current_raw, shadowing_nodes = (
-                    self._plugin_channel_modes_node(raw, platform)
+                canonical_channel, candidate_value, changed = config_updater(
+                    raw,
+                    channel_id,
+                    policy,
+                    value,
                 )
-                current = validator(current_raw)
-                policy = str(policy or "").strip().lower()
-                normalized_value = str(value or "").strip().lower()
-                candidate_value = None if normalized_value == "reset" else normalized_value
-                probe = validator(
-                    {channel_id: {policy: candidate_value}}
-                    if candidate_value is not None
-                    else {channel_id: {"listen": "always"}}
-                )
-                canonical_channel = next(iter(probe))
-                updated = {cid: dict(modes) for cid, modes in current.items()}
-                channel_modes = updated.get(canonical_channel, {})
-                if candidate_value is None:
-                    if policy not in {"listen", "replies"}:
-                        raise ValueError(f"unsupported channel policy {policy!r}")
-                    channel_modes.pop(policy, None)
-                else:
-                    channel_modes[policy] = candidate_value
-                if channel_modes:
-                    updated[canonical_channel] = channel_modes
-                else:
-                    updated.pop(canonical_channel, None)
-                validated = validator(updated)
                 current_bytes = config_path.read_bytes() if config_path.exists() else None
                 if current_bytes != before:
                     raise RuntimeError(
                         "config.yaml changed outside the supported mutation lock; retry the command"
                     )
-                if (
-                    current_raw == current
-                    and validated == current
-                    and not shadowing_nodes
-                ):
+                if not changed:
                     return canonical_channel, candidate_value
-                if validated:
-                    extra["channel_modes"] = validated
-                else:
-                    extra.pop("channel_modes", None)
-                for shadowing_extra in shadowing_nodes:
-                    shadowing_extra.pop("channel_modes", None)
                 config_mod.atomic_config_write(config_path, raw, sort_keys=False)
                 return canonical_channel, candidate_value
 
@@ -1132,8 +1073,10 @@ class GatewayBusySessionMixin:
             initial_adapter = self._authorization_adapter(
                 platform_enum, live_profile
             )
-            validator = getattr(initial_adapter, "validate_channel_modes", None)
-            if not callable(validator):
+            config_updater = getattr(
+                initial_adapter, "update_channel_policy_config", None
+            )
+            if not callable(config_updater):
                 return {
                     "ok": False,
                     "error": "unsupported_platform_action",
@@ -1149,7 +1092,7 @@ class GatewayBusySessionMixin:
                     policy=policy,
                     value=value,
                     source_identity_candidates=source_identity_candidates,
-                    validator=validator,
+                    config_updater=config_updater,
                 )
             except LookupError as exc:
                 return {
@@ -1287,7 +1230,10 @@ class GatewayBusySessionMixin:
             plugin_entry = get_plugin_command(name)
         except Exception:
             plugin_entry = None
-        if plugin_entry is not None and policy == "dispatch":
+        if plugin_entry is not None and policy in (
+            "dispatch",
+            "interrupt_then_dispatch",
+        ):
             return await self._dispatch_registered_plugin_command(event, source, name)
         if handler_key:
             special = self._BUSY_SPECIAL_HANDLERS.get(handler_key)
@@ -1465,11 +1411,44 @@ class GatewayBusySessionMixin:
             return None
         identity_candidates = self._plugin_source_identity_candidates(source)
         try:
-            from hermes_cli.plugins import get_plugin_command, plugin_command_access_level
+            from hermes_cli.plugins import (
+                PluginCommandAccessContext,
+                get_plugin_command,
+                plugin_command_access_level,
+            )
 
             plugin_entry = get_plugin_command(canonical_cmd)
             required_access = (
-                plugin_command_access_level(plugin_entry, raw_args)
+                plugin_command_access_level(
+                    plugin_entry,
+                    raw_args,
+                    PluginCommandAccessContext(
+                        platform=(
+                            getattr(getattr(source, "platform", None), "value", "")
+                            or ""
+                        ),
+                        channel_id=str(getattr(source, "chat_id", None) or ""),
+                        thread_id=(
+                            str(getattr(source, "thread_id", None))
+                            if getattr(source, "thread_id", None) is not None
+                            else None
+                        ),
+                        chat_type=str(getattr(source, "chat_type", None) or ""),
+                        scope_id=(
+                            str(
+                                getattr(source, "scope_id", None)
+                                or getattr(source, "guild_id", None)
+                            )
+                            if (
+                                getattr(source, "scope_id", None)
+                                or getattr(source, "guild_id", None)
+                            )
+                            else None
+                        ),
+                        source_identity_candidates=identity_candidates,
+                        routed_profile=self._plugin_routed_profile(source),
+                    ),
+                )
                 if plugin_entry is not None
                 else None
             )
@@ -1482,11 +1461,7 @@ class GatewayBusySessionMixin:
             return None
         policy = (
             self._plugin_slash_access_policy(source)
-            if (
-                plugin_entry is not None
-                and plugin_entry.get("with_context")
-                and getattr(source, "profile", None)
-            )
+            if plugin_entry is not None and getattr(source, "profile", None)
             else _policy_for_source(self.config, source)
         )
         if required_access == "admin":

@@ -243,3 +243,54 @@ async def test_contextual_plugin_reject_while_busy_is_control_response(monkeypat
 
     assert "can't run mid-turn" in response
     handler.assert_not_awaited()
+
+
+def test_legacy_plugin_without_busy_policy_keeps_pre_metadata_queue_behavior(
+    monkeypatch,
+):
+    manager = PluginManager()
+    ctx = PluginContext(PluginManifest(name="fixture", source="user"), manager)
+    ctx.register_command("legacy", lambda raw_args: raw_args)
+    monkeypatch.setattr(
+        "hermes_cli.plugins._ensure_plugins_discovered", lambda force=False: manager
+    )
+    from hermes_cli.commands import resolve_gateway_command, should_bypass_active_session
+
+    assert manager._plugin_commands["legacy"]["busy_policy"] is None
+    assert resolve_gateway_command("legacy").busy_policy == "reject"
+    assert should_bypass_active_session("legacy") is False
+
+
+@pytest.mark.asyncio
+async def test_plugin_interrupt_then_dispatch_runs_plugin_handler(monkeypatch):
+    runner, _adapter = _make_runner()
+    handler = AsyncMock(return_value="interrupted-plugin-ok")
+    manager = PluginManager()
+    ctx = PluginContext(PluginManifest(name="fixture", source="user"), manager)
+    ctx.register_command(
+        "interrupting",
+        handler,
+        access="user",
+        busy_policy="interrupt_then_dispatch",
+    )
+    monkeypatch.setattr(
+        "hermes_cli.plugins._ensure_plugins_discovered", lambda force=False: manager
+    )
+    from hermes_cli.commands import (
+        is_interrupt_then_dispatch,
+        resolve_gateway_command,
+        should_bypass_active_session,
+    )
+
+    cmd_def = resolve_gateway_command("interrupting")
+    assert should_bypass_active_session("interrupting") is True
+    assert is_interrupt_then_dispatch("interrupting") is True
+    response = await runner._dispatch_busy_slash_command(
+        _make_event("/interrupting now"),
+        cmd_def,
+        build_session_key(_make_source()),
+        _make_source(),
+    )
+
+    assert response == "interrupted-plugin-ok"
+    handler.assert_awaited_once_with("now")

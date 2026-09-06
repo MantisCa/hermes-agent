@@ -679,6 +679,59 @@ def _validate_channel_modes(raw: Any) -> Dict[str, Dict[str, str]]:
     return normalized
 
 
+def _channel_modes_config_node(
+    raw: dict,
+) -> Tuple[dict, Any, Tuple[dict, ...]]:
+    """Resolve Buzz's effective channel modes and canonical write location."""
+    node = raw
+    for segment in ("gateway", "platforms", "buzz", "extra"):
+        child = node.get(segment)
+        if child is None:
+            child = {}
+            node[segment] = child
+        if not isinstance(child, dict):
+            raise ValueError(
+                "cannot write gateway.platforms.buzz.extra: "
+                f"{segment!r} is not a mapping"
+            )
+        node = child
+
+    modes = node.get("channel_modes", {})
+    shadowing_nodes: List[dict] = []
+    gateway = raw.get("gateway") if isinstance(raw, dict) else None
+    top_platforms = raw.get("platforms") if isinstance(raw, dict) else None
+    for parent in (top_platforms, gateway):
+        block = parent.get("buzz") if isinstance(parent, dict) else None
+        extra = block.get("extra") if isinstance(block, dict) else None
+        if isinstance(extra, dict) and extra is not node and "channel_modes" in extra:
+            modes = extra.get("channel_modes")
+            shadowing_nodes.append(extra)
+    return node, {} if modes is None else modes, tuple(shadowing_nodes)
+
+
+def _require_mention_from_profile_config(config: Any) -> bool:
+    """Resolve the inherited listen default from one routed profile config."""
+    extra = getattr(config, "extra", None)
+    raw = extra.get("require_mention", True) if isinstance(extra, dict) else True
+    return str(raw).strip().lower() not in ("false", "0", "no", "off")
+
+
+def _reply_mode_from_profile_config(config: Any) -> str:
+    """Resolve the inherited reply default from one routed profile config."""
+    extra = getattr(config, "extra", None)
+    extra = extra if isinstance(extra, dict) else {}
+    mode = str(getattr(config, "reply_to_mode", "first") or "first").strip().lower()
+    reply_in_thread = extra.get("reply_in_thread")
+    if reply_in_thread is not None and str(reply_in_thread).strip().lower() in (
+        "false",
+        "0",
+        "no",
+        "off",
+    ):
+        return "off"
+    return mode
+
+
 def _resolve_effective_listen_mode(
     channel_modes: Dict[str, Dict[str, str]],
     channel_id: Any,
@@ -725,10 +778,15 @@ def _is_exact_buzz_command(content: str) -> bool:
     return bool(parts and parts[0].lower() == "/buzz")
 
 
-def _buzz_command_access(raw_args: str) -> str:
-    """Only the three exact, read-only status forms are user-accessible."""
+def _buzz_command_access(raw_args: str, context: Any = None) -> str:
+    """Allow status everywhere and valid DM no-ops; mutations stay admin."""
     parsed = _parse_buzz_command(raw_args)
-    return "user" if parsed is not None and parsed[1] is None else "admin"
+    if parsed is not None and parsed[1] is None:
+        return "user"
+    chat_type = str(getattr(context, "chat_type", "") or "").strip().lower()
+    if parsed is not None and chat_type in {"dm", "direct", "private"}:
+        return "user"
+    return "admin"
 
 
 def _parse_buzz_command(raw_args: str) -> Optional[Tuple[str, Optional[str]]]:
@@ -854,6 +912,8 @@ class BuzzAdapter(BasePlatformAdapter):
         # Sparse, profile-scoped controls are fully validated before this adapter accepts events.
         self._channel_modes = _validate_channel_modes(extra.get("channel_modes"))
         self._routed_channel_modes: Dict[str, Dict[str, Dict[str, str]]] = {}
+        self._routed_require_mention: Dict[str, bool] = {}
+        self._routed_reply_to_modes: Dict[str, str] = {}
         # Inbound transport: "auto" (WebSocket with poll fallback), "websocket" (required), "poll".
         _transport_raw = _scoped_platform_setting("BUZZ_TRANSPORT", extra, "transport")
         _transport = (_transport_raw or str(extra.get("transport", "auto") or "auto")).strip().lower()
@@ -944,6 +1004,53 @@ class BuzzAdapter(BasePlatformAdapter):
         """Validate a complete persisted mapping for the host mutation service."""
         return _validate_channel_modes(raw)
 
+    @staticmethod
+    def update_channel_policy_config(
+        raw: dict,
+        channel_id: str,
+        policy: str,
+        value: str,
+    ) -> Tuple[str, Optional[str], bool]:
+        """Apply one sparse Buzz policy mutation to raw profile config."""
+        extra, current_raw, shadowing_nodes = _channel_modes_config_node(raw)
+        current = _validate_channel_modes(current_raw)
+        policy = str(policy or "").strip().lower()
+        if policy not in _CHANNEL_POLICY_KEYS:
+            raise ValueError(f"unsupported Buzz channel policy {policy!r}")
+        normalized_value = str(value or "").strip().lower()
+        candidate_value = None if normalized_value == "reset" else normalized_value
+        canonical_channel = _canonical_channel_id(channel_id)
+        if candidate_value is not None:
+            _validate_channel_modes(
+                {canonical_channel: {policy: candidate_value}}
+            )
+
+        updated = {cid: dict(modes) for cid, modes in current.items()}
+        channel_modes = updated.get(canonical_channel, {})
+        if candidate_value is None:
+            channel_modes.pop(policy, None)
+        else:
+            channel_modes[policy] = candidate_value
+        if channel_modes:
+            updated[canonical_channel] = channel_modes
+        else:
+            updated.pop(canonical_channel, None)
+        validated = _validate_channel_modes(updated)
+        changed = (
+            current_raw != current
+            or validated != current
+            or bool(shadowing_nodes)
+        )
+        if not changed:
+            return canonical_channel, candidate_value, False
+        if validated:
+            extra["channel_modes"] = validated
+        else:
+            extra.pop("channel_modes", None)
+        for shadowing_extra in shadowing_nodes:
+            shadowing_extra.pop("channel_modes", None)
+        return canonical_channel, candidate_value, True
+
     def hydrate_routed_profile_config(
         self, profile_name: str, config: Any
     ) -> None:
@@ -954,6 +1061,10 @@ class BuzzAdapter(BasePlatformAdapter):
         extra = getattr(config, "extra", None)
         raw = extra.get("channel_modes") if isinstance(extra, dict) else None
         self._routed_channel_modes[profile] = _validate_channel_modes(raw)
+        self._routed_require_mention[profile] = _require_mention_from_profile_config(
+            config
+        )
+        self._routed_reply_to_modes[profile] = _reply_mode_from_profile_config(config)
 
     def _channel_modes_for_profile(
         self, routed_profile: Optional[str]
@@ -962,6 +1073,18 @@ class BuzzAdapter(BasePlatformAdapter):
         if profile and profile in self._routed_channel_modes:
             return self._routed_channel_modes[profile]
         return self._channel_modes
+
+    def _require_mention_for_profile(self, routed_profile: Optional[str]) -> bool:
+        profile = str(routed_profile or "").strip()
+        if profile and profile in self._routed_require_mention:
+            return self._routed_require_mention[profile]
+        return self.require_mention
+
+    def _reply_mode_for_profile(self, routed_profile: Optional[str]) -> str:
+        profile = str(routed_profile or "").strip()
+        if profile and profile in self._routed_reply_to_modes:
+            return self._routed_reply_to_modes[profile]
+        return self._reply_to_mode
 
     def apply_channel_policy(
         self,
@@ -1063,7 +1186,7 @@ class BuzzAdapter(BasePlatformAdapter):
         return _resolve_effective_listen_mode(
             self._channel_modes_for_profile(routed_profile),
             channel_id,
-            require_mention=self.require_mention,
+            require_mention=self._require_mention_for_profile(routed_profile),
             chat_type=chat_type,
         )
 
@@ -1081,7 +1204,7 @@ class BuzzAdapter(BasePlatformAdapter):
         return _resolve_effective_reply_mode(
             self._channel_modes_for_profile(routed_profile),
             channel_id,
-            reply_to_mode=self._reply_to_mode,
+            reply_to_mode=self._reply_mode_for_profile(routed_profile),
             chat_type=chat_type,
         )
 

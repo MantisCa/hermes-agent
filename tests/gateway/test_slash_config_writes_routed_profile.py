@@ -73,7 +73,9 @@ async def test_slash_config_writes_hit_routed_profile_and_leave_default_untouche
     assert (default_home / "config.yaml").read_bytes() == default_before
 
 
-def test_contextual_plugin_admin_gate_reads_routed_profile(homes, monkeypatch):
+def test_plugin_admin_gate_reads_routed_profile_without_handler_context(
+    homes, monkeypatch
+):
     default_home, routed_home = homes
     (default_home / "config.yaml").write_text(
         "gateway:\n  platforms:\n    buzz:\n      extra:\n"
@@ -97,11 +99,12 @@ def test_contextual_plugin_admin_gate_reads_routed_profile(homes, monkeypatch):
         "hermes_cli.profiles.get_profile_dir", lambda _name: routed_home
     )
     monkeypatch.setattr(
-        "hermes_cli.plugins.get_plugin_command", lambda _name: {"with_context": True}
+        "hermes_cli.plugins.get_plugin_command",
+        lambda _name: {"with_context": False},
     )
     monkeypatch.setattr(
         "hermes_cli.plugins.plugin_command_access_level",
-        lambda _entry, _args: "admin",
+        lambda _entry, _args, _context: "admin",
     )
 
     assert runner._check_slash_access(source, "buzz", "listen always") is None

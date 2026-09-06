@@ -214,6 +214,19 @@ class LoadedPlugin:
 
 
 @dataclass(frozen=True)
+class PluginCommandAccessContext:
+    """Minimal immutable source context for gateway access classifiers."""
+
+    platform: str
+    channel_id: str
+    thread_id: Optional[str]
+    chat_type: str
+    scope_id: Optional[str]
+    source_identity_candidates: Tuple[str, ...]
+    routed_profile: str
+
+
+@dataclass(frozen=True)
 class PluginCommandInvocation:
     """Minimal immutable gateway context for an opted-in plugin command."""
 
@@ -671,8 +684,8 @@ class PluginContext:
         argument_mode: str | None = None,
         *,
         with_context: bool = False,
-        access: Callable[[str], str] | str | None = None,
-        busy_policy: str = "reject",
+        access: Callable[..., str] | str | None = None,
+        busy_policy: str | None = None,
     ) -> Optional[PluginRegistration]:
         """Register a slash command (e.g. ``/lcm``) available in CLI and gateway sessions.
 
@@ -683,11 +696,14 @@ class PluginContext:
         Handlers may be synchronous or asynchronous.
 
         ``access`` may be ``"user"``, ``"admin"``, or a callable that maps
-        raw arguments to one of those values. Invalid values and classifier
-        failures resolve to ``"admin"``. Omit it to preserve the existing
-        platform slash-command policy.
+        raw arguments to one of those values. A callable may optionally accept
+        ``PluginCommandAccessContext`` as a second argument. Invalid values and
+        classifier failures resolve to ``"admin"``. Omit it to preserve the
+        existing platform slash-command policy.
 
         ``busy_policy`` uses the same values as core ``CommandDef`` entries.
+        Omit it to preserve the legacy active-session message path; setting it
+        explicitly opts into the gateway's active-turn bypass dispatcher.
 
         Unlike ``register_cli_command()`` (which creates ``hermes <subcommand>``
         terminal commands), this registers in-session slash commands that users
@@ -720,15 +736,17 @@ class PluginContext:
             from hermes_cli.commands import VALID_BUSY_POLICIES
         except Exception:
             VALID_BUSY_POLICIES = frozenset({"dispatch", "reject", "interrupt_then_dispatch"})
-        normalized_busy = str(busy_policy or "reject").strip().lower()
-        if normalized_busy not in VALID_BUSY_POLICIES:
-            logger.warning(
-                "Plugin '%s' registered invalid busy policy %r for '/%s'; using reject.",
-                self.manifest.name,
-                busy_policy,
-                clean,
-            )
-            normalized_busy = "reject"
+        normalized_busy = None
+        if busy_policy is not None:
+            normalized_busy = str(busy_policy).strip().lower()
+            if normalized_busy not in VALID_BUSY_POLICIES:
+                logger.warning(
+                    "Plugin '%s' registered invalid busy policy %r for '/%s'; using reject.",
+                    self.manifest.name,
+                    busy_policy,
+                    clean,
+                )
+                normalized_busy = "reject"
         if access is not None and not callable(access) and access not in {"user", "admin"}:
             logger.warning(
                 "Plugin '%s' registered invalid access metadata for '/%s'; using admin.",
@@ -2048,13 +2066,27 @@ def get_plugin_command(name: str) -> Optional[dict]:
     return _ensure_plugins_discovered()._plugin_commands.get(clean)
 
 
-def plugin_command_access_level(entry: Mapping[str, Any], raw_args: str) -> str | None:
-    """Resolve argument-aware access, failing closed to explicit admin."""
+def plugin_command_access_level(
+    entry: Mapping[str, Any],
+    raw_args: str,
+    context: PluginCommandAccessContext | None = None,
+) -> str | None:
+    """Resolve source-aware access while preserving one-argument classifiers."""
     access = entry.get("access")
     if access is None:
         return None
     try:
-        level = access(raw_args) if callable(access) else access
+        if callable(access):
+            accepts_context = False
+            try:
+                inspect.signature(access).bind(raw_args, context)
+            except (TypeError, ValueError):
+                pass
+            else:
+                accepts_context = True
+            level = access(raw_args, context) if accepts_context else access(raw_args)
+        else:
+            level = access
     except Exception:
         logger.warning("Plugin command access classifier failed", exc_info=True)
         return "admin"

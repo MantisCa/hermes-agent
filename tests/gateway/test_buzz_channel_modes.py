@@ -13,6 +13,8 @@ import yaml
 from gateway.config import Platform, PlatformConfig, load_gateway_config
 from gateway.profile_routing import ProfileRoute
 from gateway.run import GatewayRunner
+from gateway.session import SessionSource
+from hermes_cli.plugins import PluginCommandAccessContext
 from tests.gateway._plugin_adapter_loader import load_plugin_adapter
 
 
@@ -48,6 +50,48 @@ def test_mutations_and_malformed_forms_fail_closed_to_admin(args):
     assert _buzz._buzz_command_access(args) == "admin"
 
 
+def test_valid_dm_mutation_reaches_noop_while_group_mutation_stays_admin():
+    def context(chat_type):
+        return PluginCommandAccessContext(
+            platform="buzz",
+            channel_id=CHANNEL,
+            thread_id=None,
+            chat_type=chat_type,
+            scope_id=None,
+            source_identity_candidates=("ordinary",),
+            routed_profile="default",
+        )
+
+    assert _buzz._buzz_command_access("listen always", context("dm")) == "user"
+    assert _buzz._buzz_command_access("listen always", context("group")) == "admin"
+    assert _buzz._buzz_command_access("listen sometimes", context("dm")) == "admin"
+
+
+def test_gateway_access_allows_valid_dm_noop_for_non_admin(monkeypatch):
+    adapter = _adapter()
+    runner = _runner_for_profiles(adapter)
+    runner.config = SimpleNamespace(
+        platforms={
+            Platform("buzz"): PlatformConfig(
+                enabled=True,
+                extra={"allow_admin_from": [ADMIN_NPUB]},
+            )
+        }
+    )
+    source = SessionSource(
+        platform=Platform("buzz"),
+        user_id="ordinary",
+        chat_id=CHANNEL,
+        chat_type="dm",
+    )
+    monkeypatch.setattr(
+        "hermes_cli.plugins.get_plugin_command",
+        lambda _name: {"access": _buzz._buzz_command_access, "with_context": True},
+    )
+
+    assert runner._check_slash_access(source, "buzz", "listen always") is None
+
+
 def test_adapter_hydrates_strict_sparse_modes_and_reports_inheritance():
     adapter = _adapter(
         extra={
@@ -67,6 +111,44 @@ def test_adapter_hydrates_strict_sparse_modes_and_reports_inheritance():
         "applicable": True,
         "listen": {"effective": "mentions", "source": "inherited"},
         "replies": {"effective": "threaded", "source": "inherited"},
+    }
+
+
+def test_shared_transport_hydrates_routed_inherited_defaults_and_reset():
+    adapter = _adapter(extra={"require_mention": True}, reply_to_mode="first")
+    adapter.hydrate_routed_profile_config(
+        "team-b",
+        PlatformConfig(
+            enabled=False,
+            reply_to_mode="first",
+            extra={"require_mention": False, "reply_in_thread": False},
+        ),
+    )
+
+    assert adapter.channel_policy_status(CHANNEL) == {
+        "applicable": True,
+        "listen": {"effective": "mentions", "source": "inherited"},
+        "replies": {"effective": "threaded", "source": "inherited"},
+    }
+    assert adapter.channel_policy_status(CHANNEL, routed_profile="team-b") == {
+        "applicable": True,
+        "listen": {"effective": "always", "source": "inherited"},
+        "replies": {"effective": "flat", "source": "inherited"},
+    }
+
+    adapter.apply_channel_policy(
+        CHANNEL, "listen", "mentions", routed_profile="team-b"
+    )
+    adapter.apply_channel_policy(
+        CHANNEL, "replies", "threaded", routed_profile="team-b"
+    )
+    adapter.apply_channel_policy(CHANNEL, "listen", None, routed_profile="team-b")
+    adapter.apply_channel_policy(CHANNEL, "replies", None, routed_profile="team-b")
+
+    assert adapter.channel_policy_status(CHANNEL, routed_profile="team-b") == {
+        "applicable": True,
+        "listen": {"effective": "always", "source": "inherited"},
+        "replies": {"effective": "flat", "source": "inherited"},
     }
 
 
