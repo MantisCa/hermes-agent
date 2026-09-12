@@ -459,7 +459,7 @@ async def test_gateway_buzz_metadata_keeps_trigger_and_placement_for_progress(
 @pytest.mark.asyncio
 async def test_base_final_response_threads_top_level_buzz_attachment(tmp_path):
     """The real Base final-response path gives Buzz files trigger metadata."""
-    from gateway.platforms.base import MessageEvent, MessageType
+    from gateway.platforms.event import MessageEvent, MessageType
     from gateway.session import build_session_key
 
     attachment = tmp_path / "report.pdf"
