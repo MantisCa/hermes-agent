@@ -933,6 +933,44 @@ class TestDeliveryParity:
         assert plugins_mod.invoke_hook("anything") == ["stubbed"]
 
 
+class TestAsyncHookCallbacks:
+    """``async def`` hook callbacks run and their values land in the results (#12449)."""
+
+    def test_async_hook_result_is_awaited_alongside_sync(self):
+        mgr = PluginManager()
+
+        def sync_hook(**kwargs):
+            return {"context": "sync"}
+
+        async def async_hook(session_id, **kwargs):
+            return {"context": f"async:{session_id}"}
+
+        mgr._hooks.setdefault("pre_llm_call", []).extend([sync_hook, async_hook])
+        results = mgr.invoke_hook("pre_llm_call", session_id="s1", user_message="hi",
+                                  conversation_history=[], is_first_turn=True, model="m")
+        assert results == [{"context": "sync"}, {"context": "async:s1"}]
+
+    def test_async_hook_resolves_under_a_running_loop(self):
+        """Gateway handlers call invoke_hook from inside asyncio; a bare asyncio.run would raise.
+        The helper thread must also carry the caller's ContextVars (profile / secret scope)."""
+        import asyncio
+        import contextvars
+
+        scope = contextvars.ContextVar("hook_scope", default="default")
+        mgr = PluginManager()
+
+        async def async_hook(**kwargs):
+            return f"from-async:{scope.get()}"
+
+        mgr._hooks.setdefault("post_tool_call", []).append(async_hook)
+
+        async def driver():
+            scope.set("profile-b")
+            return mgr.invoke_hook("post_tool_call", tool_name="t", args={}, result="r", duration_ms=1)
+
+        assert asyncio.run(driver()) == ["from-async:profile-b"]
+
+
 class TestForceReloadSymmetry:
     """Force rediscovery restores non-plugin state it wiped (#64178)."""
 
